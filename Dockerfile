@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.94.1-bookworm AS build
+FROM rust:1.99.0-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
