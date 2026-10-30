@@ -1,0 +1,54 @@
+name: inkspect-engine
+services:
+  engine:
+    profiles: [review]
+    build: .
+    # Match the owner of the local report directory on Linux.
+    user: "${INKSPECT_UID:-1000}:${INKSPECT_GID:-1000}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    mem_limit: 2g
+    pids_limit: 256
+    environment:
+      HOME: /tmp
+      AWS_REGION: ${AWS_REGION:-eu-west-2}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+      INKSPECT_GITHUB_READ_TOKEN: ${INKSPECT_GITHUB_READ_TOKEN:-}
+      INKSPECT_GITHUB_WRITE_TOKEN: ${INKSPECT_GITHUB_WRITE_TOKEN:-}
+      INKSPECT_QDRANT_URL: http://qdrant:6333
+      INKSPECT_QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - type: bind
+        source: ${INKSPECT_REPO_PATH:-.}
+        target: /workspace
+        read_only: true
+      - type: bind
+        source: ${INKSPECT_CONFIG:-./examples/host.example.json}
+        target: /config/host.json
+        read_only: true
+      - type: bind
+        source: ${INKSPECT_JOB:-./examples/job.example.json}
+        target: /config/job.json
+        read_only: true
+      - type: bind
+        source: ./.local/reports
+        target: /reports
+  qdrant:
+    profiles: [context]
+    image: qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - qdrant-data:/qdrant/storage
+volumes:
+  qdrant-data:

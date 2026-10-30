@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+__pycache__/
+
+# Local configuration, reports and optional prompt captures.
+/.local/
+.env
+.env.*
+!.env.example

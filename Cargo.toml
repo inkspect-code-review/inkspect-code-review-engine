@@ -1,0 +1,37 @@
+[package]
+name = "inkspect-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+description = "AI code reviews for local projects and GitHub pull requests, with your own model credentials."
+license = "MIT"
+repository = "https://github.com/inkspect-code-review/inkspect-code-review-engine"
+homepage = "https://inkspect.si"
+readme = "README.md"
+keywords = ["code-review", "ai", "cli", "bedrock", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "inkspect-engine"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "process", "fs", "time", "io-util", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tempfile = "3.14"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1.70"
+aws-smithy-types = "1.2"
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+rsa = { version = "0.9", features = ["sha2"] }
+rand = "0.8"

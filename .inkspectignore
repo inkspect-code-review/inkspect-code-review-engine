@@ -1,0 +1,36 @@
+# Inkspect review exclusions. Copy or merge these rules into your project.
+# GitHub PR reviews use the policy from the comparison base.
+# Local reviews use this file from the current project folder.
+
+# Build output, downloaded dependencies and generated reports.
+target/
+node_modules/
+vendor/
+dist/
+build/
+coverage/
+__pycache__/
+venv/
+.local/
+**/*.min.js
+**/*.min.css
+**/*.map
+
+# Local credentials and private key material.
+.git/
+.aws/
+.ssh/
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.tfstate
+
+# Dependency manifests/lockfiles, tests and CI configuration stay in scope.
+# Add project-specific patterns below. Use !pattern to re-include a path.
+# This is a scope policy, not a complete secret scanner.

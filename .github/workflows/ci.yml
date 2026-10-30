@@ -1,0 +1,59 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.94.1-${{ hashFiles('Cargo.lock') }}
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - run: cargo +1.94.1 test --locked
+      - run: cargo +1.94.1 build --locked
+      - run: ./target/debug/inkspect-engine --help
+      - run: ./target/debug/inkspect-engine local --help
+      - name: Validate Compose
+        if: runner.os == 'Linux'
+        run: docker compose --profile review --profile context config --quiet
+  title:
+    name: Pull request title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check conventional title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          title = os.environ['PR_TITLE']
+          pattern = r'(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)\([a-z0-9-]+\)!?: [a-z].+'
+          if not re.fullmatch(pattern, title) or len(title) > 72 or title.endswith('.'):
+              raise SystemExit('Use type(scope): short imperative description (max 72 characters).')
+          PY

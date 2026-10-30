@@ -1,0 +1,27 @@
+{
+  "model_region": "eu-west-2",
+  "model_id": "YOUR_BEDROCK_MODEL_ID",
+  "model_max_output_tokens": 8192,
+  "timeout_seconds": 1800,
+  "retrieval": {
+    "region": "eu-west-2",
+    "embed_model": "eu.cohere.embed-v4:0",
+    "rerank_region": "eu-central-1",
+    "rerank_model": "cohere.rerank-v3-5:0",
+    "dimensions": 1024,
+    "candidates": 40,
+    "top_n": 8,
+    "queries": 8,
+    "content_bytes": 0,
+    "max_files": 0
+  },
+  "sandbox": {
+    "runtime": "docker",
+    "image": "",
+    "cpu_millis": 2000,
+    "memory_mib": 2048,
+    "pids": 256,
+    "clone_mib": 500,
+    "containerize": false
+  }
+}
