@@ -1385,7 +1385,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "hex",
  "rand 0.8.8",
