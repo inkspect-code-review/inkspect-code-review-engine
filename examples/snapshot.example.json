@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "task": {
+    "id": "example-task",
+    "instructions": "Return 2 from value.",
+    "criteria": [
+      {
+        "id": "C1",
+        "text": "value returns 2",
+        "verification": "source"
+      }
+    ]
+  },
+  "baseline": {
+    "kind": "revision",
+    "reference": "integration-base"
+  },
+  "snapshot_id": "sha256:842bf9c8031ea5ee831220f0696efee9356c8d16700384c2bd9b6921442f3ffc",
+  "files": [
+    {
+      "path": "src/example.rs",
+      "before": "fn value() -> i32 { 1 }\n",
+      "after": "fn value() -> i32 { 2 }\n",
+      "role": "changed"
+    }
+  ],
+  "tests": [],
+  "omissions": []
+}

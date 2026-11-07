@@ -613,3 +613,42 @@ calling a model. Source modules are grouped by responsibility:
 
 Licensed under the [MIT License](LICENSE). The Inkspect name and logo identify
 the project; using them must not imply endorsement of your own product.
+
+## Inline snapshot reviews for integrations
+
+Integrations can supply before/after source text without mounting a repository:
+
+```sh
+./target/release/inkspect-engine snapshot \
+  --config .local/host.json --request examples/snapshot.example.json \
+  --out .local/snapshot-report.json
+```
+
+Use the existing operator-owned model configuration and credential transport.
+The snapshot command never reads paths from the supplied source list, accesses
+GitHub, or executes project code. It computes changed lines from the inline
+contents and uses the existing single-call reviewer and changed-line checks.
+
+The request contains the original task, source or execution acceptance criteria,
+a comparison baseline label, full before/after files, client-reported tests and
+explicit omissions. See `examples/snapshot.example.json`. Added/deleted files
+use null before/after values; context files have equal contents. Renames can be
+represented as deletion plus addition. The snapshot ID is SHA-256 of the UTF-8
+compact JSON file array sorted by path, with each file's fields ordered as
+`path`, `before`, `after`, `role`. Prefix it with `sha256:`. Test records contain
+`id`, `command`, `exit_code`, `output`, and that exact `snapshot_id`.
+
+Limits are 750,000 request bytes, 80 files, 64,000 bytes per before/after value,
+400,000 source bytes, 1-30 criteria, 10 test records with at most 8,000 output
+bytes each, and 200 omissions. Sensitive paths, symlinks represented by callers,
+binary contents and invalid digests must not be submitted. The engine validates
+inline paths and bounded text and never resolves them on the filesystem.
+
+The output wraps the ordinary review in `review` and includes `assessments`,
+`evidence` and `snapshot_id`. Source citations are checked against the supplied
+contents. They do not prove that a remote repository matches the snapshot.
+Client test references are labeled `client_supplied`; execution criteria cannot
+be independently satisfied by those claims. Missing/duplicate criteria or
+unsupported citations become unverified. Declared omissions make coverage
+incomplete. The integration owns source transport, authorization, storage and
+cleanup; the engine performs no automatic retry of a paid model call.

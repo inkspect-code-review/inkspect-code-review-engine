@@ -22,6 +22,7 @@
 
 mod audit;
 mod local;
+mod snapshot;
 mod byok;
 mod fix;
 mod config;
@@ -57,6 +58,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Review an inline before/after snapshot and task criteria without a repository.
+    Snapshot {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] request: PathBuf,
+        #[arg(long)] out: PathBuf,
+    },
     /// Review a local working tree or folder without GitHub access.
     Local {
         #[arg(long)] config: PathBuf,
@@ -128,6 +135,15 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> error::Result<()> {
     match cli.command {
+        Command::Snapshot { config, request, out } => {
+            let host: HostConfig = load_json(&config, "host config")?;
+            let input: snapshot::Input = load_json(&request, "inline snapshot")?;
+            let report = tokio::time::timeout(std::time::Duration::from_secs(host.timeout_seconds), snapshot::run(&host, input)).await
+                .map_err(|_| error::err(error::Code::Internal, "snapshot review timeout"))??;
+            std::fs::write(out, serde_json::to_vec(&report).map_err(|_| error::err(error::Code::Internal, "snapshot encoding failed"))?)
+                .map_err(|_| error::err(error::Code::Internal, "snapshot report write failed"))?;
+            Ok(())
+        },
         Command::Local {config,repo,base,out,format} => {
             let host: HostConfig = load_json(&config, "host config")?;
             let report = tokio::time::timeout(std::time::Duration::from_secs(host.timeout_seconds), local::run(&host,&repo,base.as_deref())).await

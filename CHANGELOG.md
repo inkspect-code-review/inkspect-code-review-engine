@@ -11,6 +11,16 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-06
+
+#### Added
+
+- Inline before/after snapshot reviews for agent and editor integrations, with
+  task acceptance criteria, verified source citations and explicit client-test
+  provenance. Missing evidence and runtime-only criteria stay unverified; no
+  repository access or project execution is required. Added regression coverage
+  for input digests, unsafe paths, unsupported assessments and incomplete scope.
+
 ### 2026-10-30
 
 #### Added

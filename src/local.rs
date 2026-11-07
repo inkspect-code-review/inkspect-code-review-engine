@@ -191,7 +191,7 @@ fn text(bytes: Option<Vec<u8>>) -> Result<Option<String>> {
     }
     Ok(Some(value))
 }
-async fn change(path: &str, before: Option<&str>, after: Option<&str>) -> Result<ChangedFile> {
+pub(crate) async fn change(path: &str, before: Option<&str>, after: Option<&str>) -> Result<ChangedFile> {
     let old = before.unwrap_or("");
     let new = after.unwrap_or("");
     // Diff only captured regular files in a private directory, never user filters.
