@@ -16,6 +16,7 @@ use aws_sdk_bedrockruntime::types::{
     SystemContentBlock,
 };
 use aws_sdk_bedrockruntime::Client;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::Deserialize;
 
 use crate::domain::Severity;
@@ -158,9 +159,20 @@ impl ReviewModel {
     }
 
     pub async fn complete(&self, system: &str, user: &str, job: &crate::config::ReviewJob) -> Result<String> {
-        crate::audit::capture(job, &self.model_id, &self.region, self.max_output_tokens, system, user)?;
+        self.complete_captured(system, user, job, None, false).await
+    }
+
+    // A fresh, stateless call: no generator conversation or claimed verdict is
+    // forwarded. Reuse only the authenticated transport (including BYOK).
+    pub async fn complete_fix(&self, system: &str, user: &str, job: &crate::config::ReviewJob, attempt: usize, verification: bool) -> Result<String> {
+        self.complete_captured(system, user, job, Some(attempt), verification).await
+    }
+
+    async fn complete_captured(&self, system: &str, user: &str, job: &crate::config::ReviewJob, attempt: Option<usize>, verification: bool) -> Result<String> {
+        if let Some(attempt) = attempt { crate::audit::capture_fix_call(job, &self.model_id, &self.region, self.max_output_tokens, system, user, attempt, verification)?; }
+        else { crate::audit::capture(job, &self.model_id, &self.region, self.max_output_tokens, system, user)?; }
         let receipt = crate::telemetry::next_id();
-        crate::telemetry::record(serde_json::json!({"kind":"model.started", "id":receipt}))?;
+        crate::telemetry::record(serde_json::json!({"kind":"model.started", "id":receipt, "attempt":attempt, "phase":if verification {"fix_verification"} else {"generation"}}))?;
         if let Some(provider) = &self.byok { return provider.complete(system,user,self.max_output_tokens,receipt).await; }
         let out = self
             .client.as_ref().ok_or_else(||err(Code::Model,"model client unavailable"))?
@@ -185,38 +197,45 @@ impl ReviewModel {
             .send()
             .await
             .map_err(|e| {
-                // Surface the full SDK error (service message, not secrets) to
-                // debug logs so model-access/auth problems are diagnosable.
-                let detail = aws_smithy_types::error::display::DisplayErrorContext(&e);
-                tracing::debug!("converse call failed: {detail}");
+                let _ = crate::audit::capture_model_receipt(receipt, &serde_json::json!({
+                    "provider":"bedrock", "attempt":attempt, "phase":if verification {"fix_verification"} else {"generation"},
+                    "outcome":"request_failed", "http_status":e.raw_response().map(|r| r.status().as_u16()),
+                    "provider_error_code":e.as_service_error().and_then(|s|s.code())
+                }));
                 err(Code::Model, "converse call failed")
             })?;
 
         if let Some(usage) = out.usage() {
             crate::telemetry::record(serde_json::json!({"kind":"model.usage", "id":receipt, "request_id":out.request_id(), "measurement_source":"bedrock_converse", "input_tokens":i64::from(usage.input_tokens()) + i64::from(usage.cache_read_input_tokens().unwrap_or(0)) + i64::from(usage.cache_write_input_tokens().unwrap_or(0)), "output_tokens":usage.output_tokens(), "cached_input_tokens":usage.cache_read_input_tokens().unwrap_or(0), "cache_write_input_tokens":usage.cache_write_input_tokens().unwrap_or(0), "uncached_input_tokens":usage.input_tokens()}))?;
         }
-        if out.stop_reason() != &StopReason::EndTurn {
-            return Err(err(Code::Model, "model response was truncated or refused"));
-        }
-
+        // Retain provider text and stop metadata BEFORE any rejection or JSON
+        // parsing, including truncated/refused and otherwise malformed replies.
         let message = match out.output() {
-            Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(m)) => m,
-            _ => return Err(err(Code::Model, "malformed model output")),
+            Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(m)) => Some(m),
+            _ => None,
         };
-        if message.role() != &ConversationRole::Assistant {
-            return Err(err(Code::Model, "unexpected response role"));
-        }
-
         let mut text = String::new();
-        for block in message.content() {
-            if let ContentBlock::Text(t) = block {
-                if text.len() + t.len() > self.max_response_bytes {
-                    return Err(err(Code::Model, "model response too large"));
+        let mut oversized = false;
+        if let Some(message) = message {
+            for block in message.content() {
+                if let ContentBlock::Text(t) = block {
+                    if text.len() + t.len() > self.max_response_bytes { oversized = true; break; }
+                    text.push_str(t);
                 }
-                text.push_str(t);
+                // Reasoning is not part of the repair response and is not retained.
             }
-            // Reasoning and any other block kinds are ignored, never parsed.
         }
+        crate::audit::capture_model_receipt(receipt, &serde_json::json!({
+            "provider":"bedrock", "attempt":attempt, "phase":if verification {"fix_verification"} else {"generation"},
+            "request_id":out.request_id(), "stop_reason":out.stop_reason().as_str(),
+            "output_role":message.map(|m|m.role().as_str()),"response":text,"capture_truncated":oversized,
+            "usage":out.usage().map(|u|serde_json::json!({"input_tokens":u.input_tokens(),"output_tokens":u.output_tokens()}))
+        }))?;
+        if let Some(attempt) = attempt { crate::audit::capture_fix_stop(attempt, verification, out.stop_reason().as_str())?; }
+        if out.stop_reason() != &StopReason::EndTurn { return Err(err(Code::Model, "model response was truncated or refused")); }
+        let message = message.ok_or_else(||err(Code::Model,"malformed model output"))?;
+        if message.role() != &ConversationRole::Assistant { return Err(err(Code::Model,"unexpected response role")); }
+        if oversized { return Err(err(Code::Model,"model response too large")); }
 
         Ok(text)
     }

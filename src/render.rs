@@ -43,9 +43,21 @@ pub fn attach(report: &mut Report) {
 }
 
 pub fn finding_comment(f: &Finding) -> String {
-    format!("**{} · {}**\n\n{}\n\n**Suggested fix**\n{}\n\n**Verification**\n{}\n\nReply “fixed” after pushing your changes to request another review.",
+    let login = app_login(&std::env::var("INKSPECT_GITHUB_APP_SLUG").unwrap_or_default());
+    format!("**{} · {}**\n\n{}\n\n**Suggested fix**\n{}\n\n**Verification**\n{}\n\nComment `@{login} review again` after pushing your changes to request another review.",
         severity_label(f.severity), md(&sanitize_text(&f.title, 500)), md(&sanitize_text(&f.reason, 3000)),
         md(&sanitize_text(&f.suggestion, 3000)), md(&sanitize_text(&f.verification, 3000)))
+}
+
+fn app_login(value: &str) -> String {
+    let name = value.trim().to_ascii_lowercase();
+    if !name.is_empty() && name.len() <= 100
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+        name
+    } else {
+        "inkspectsi".into()
+    }
 }
 
 fn report_link(report: &Report) -> String {
@@ -359,6 +371,14 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_uses_a_valid_explicit_app_mention() {
+        assert_eq!(app_login(" Custom-Bot "), "custom-bot");
+        for value in ["", "@everyone", "bad`slug", "bot\ncommand", "/bot"] {
+            assert_eq!(app_login(value), "inkspectsi");
+        }
+    }
+
+    #[test]
     fn one_presentation_contains_scores_diagram_and_safe_inline_comments() {
         let mut report = sample_report();
         report.summary = "<script>@everyone **fake**".into();
@@ -378,6 +398,8 @@ mod tests {
         assert!(!p.markdown.contains("injected-id") && !p.markdown.contains("--> evil"));
         assert_eq!(p.github_findings["F-1"], finding_comment(&report.findings[0]));
         assert!(!p.github_findings["F-1"].contains("@user"));
+        assert!(p.github_findings["F-1"].contains(" review again`"));
+        assert!(!p.github_findings["F-1"].contains("Reply “fixed”"));
         assert_eq!(p.fix_prompt, p.finding_prompts["F-1"]);
     }
 

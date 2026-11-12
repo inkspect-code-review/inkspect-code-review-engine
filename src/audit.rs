@@ -10,6 +10,39 @@ pub fn capture(job: &ReviewJob, model: &str, region: &str, max_tokens: i32, syst
     write_private(Path::new(&path), &document(job, model, region, max_tokens, system, user))
 }
 
+pub fn capture_fix_call(job: &ReviewJob, model: &str, region: &str, max_tokens: i32, system: &str, user: &str, attempt: usize, verification: bool) -> Result<()> {
+    let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
+    let phase = if verification { "verification" } else { "generation" };
+    write_private(&Path::new(&path).with_file_name(format!("fix-attempt-{attempt}-{phase}-context.json")), &document(job, model, region, max_tokens, system, user))
+}
+
+pub fn capture_fix_verdict(raw: &str, attempt: usize) -> Result<()> {
+    let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
+    write_private(&Path::new(&path).with_file_name(format!("fix-attempt-{attempt}-verification-result.json")), &serde_json::json!({"response":raw}))
+}
+
+pub fn capture_fix_generation(raw: &str, attempt: usize) -> Result<()> {
+    let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
+    write_private(&Path::new(&path).with_file_name(format!("fix-attempt-{attempt}-generation-result.json")), &serde_json::json!({"response":raw}))
+}
+
+pub fn capture_fix_stop(attempt: usize, verification: bool, stop: &str) -> Result<()> {
+    let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
+    let phase = if verification { "verification" } else { "generation" };
+    write_private(&Path::new(&path).with_file_name(format!("fix-attempt-{attempt}-{phase}-stop.json")), &serde_json::json!({"stop_reason":stop}))
+}
+
+pub fn capture_model_receipt(receipt: usize, value: &serde_json::Value) -> Result<()> {
+    let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
+    write_private(&Path::new(&path).with_file_name(format!("model-call-{receipt}-response.json")), value)
+}
+
+pub fn capture_failure(error: &crate::error::EngineError) -> Result<()> {
+    let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
+    // Restricted operator evidence, never part of the public job or usage log.
+    write_private(&Path::new(&path).with_file_name("failure.json"), &serde_json::json!({"code":error.code.as_str(),"diagnostic_code":error.diagnostic_code(),"reason":error.reason}))
+}
+
 fn document(job: &ReviewJob, model: &str, region: &str, max_tokens: i32, system: &str, user: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,

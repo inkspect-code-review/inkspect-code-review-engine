@@ -43,20 +43,50 @@ impl Provider {
         let mut value=reqwest::header::HeaderValue::from_str(&secret).map_err(|_|err(Code::Model,"invalid provider key"))?; value.set_sensitive(true);
         let mut request=client.post(url).header(header,value).json(&body);
         if self.provider=="anthropic" {request=request.header("anthropic-version","2023-06-01");}
-        let mut response=request.send().await.map_err(|_|err(Code::Model,"provider request failed"))?;
-        if !response.status().is_success() {return Err(err(Code::Model,"provider rejected the request"));}
+        let mut response=request.send().await.map_err(|e| {
+            let _=crate::audit::capture_model_receipt(receipt,&json!({"provider":self.provider,"outcome":"request_failed",
+                "error_class":if e.is_timeout(){"timeout"}else if e.is_connect(){"connect"}else{"request"}}));
+            err(Code::Model,"provider request failed")
+        })?;
+        let status=response.status().as_u16();
+        let request_id=["x-request-id","request-id","x-goog-request-id"].iter()
+            .find_map(|h|response.headers().get(*h).and_then(|v|v.to_str().ok())).map(str::to_owned);
         let mut bytes=Vec::new();
-        while let Some(chunk)=response.chunk().await.map_err(|_|err(Code::Model,"provider response interrupted"))? {
-            if bytes.len()+chunk.len()>1024*1024 {return Err(err(Code::Model,"provider response too large"));} bytes.extend_from_slice(&chunk);
+        loop {
+            match response.chunk().await {
+                Ok(None)=>break,
+                Ok(Some(chunk))=>{
+                    if bytes.len()+chunk.len()>1024*1024 {
+                        crate::audit::capture_model_receipt(receipt,&response_receipt(&self.provider,status,request_id.as_deref(),"oversized",&bytes,&self.api_key))?;
+                        return Err(err(Code::Model,"provider response too large"));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                },
+                Err(_)=>{
+                    let _=crate::audit::capture_model_receipt(receipt,&response_receipt(&self.provider,status,request_id.as_deref(),"interrupted",&bytes,&self.api_key));
+                    return Err(err(Code::Model,"provider response interrupted"));
+                }
+            }
         }
-        let result:Value=serde_json::from_slice(&bytes).map_err(|_|err(Code::Model,"invalid provider response"))?;
-        // Persist measured usage even when a provider returns truncated JSON.
-        if let Some((input,output,cached))=usage(&self.provider,&result) {
-            crate::telemetry::record(json!({"kind":"model.usage","id":receipt,"input_tokens":input,"output_tokens":output,"cached_input_tokens":cached,"measurement_source":self.provider,"provider":self.provider,"model":self.model}))?;
+        let parsed=serde_json::from_slice::<Value>(&bytes);
+        // Usage is durable before diagnostic storage/schema validation can fail.
+        if let Ok(result)=&parsed {
+            if let Some((input,output,cached))=usage(&self.provider,result) {
+                crate::telemetry::record(json!({"kind":"model.usage","id":receipt,"input_tokens":input,"output_tokens":output,"cached_input_tokens":cached,"measurement_source":self.provider,"provider":self.provider,"model":self.model}))?;
+            }
         }
+        crate::audit::capture_model_receipt(receipt,&response_receipt(&self.provider,status,request_id.as_deref(),"received",&bytes,&self.api_key))?;
+        if !(200..300).contains(&status) {return Err(err(Code::Model,"provider rejected the request"));}
+        let result=parsed.map_err(|_|err(Code::Model,"invalid provider response"))?;
+
         text(&self.provider,&result)
     }
 }
+fn response_receipt(provider:&str,status:u16,request_id:Option<&str>,outcome:&str,bytes:&[u8],key:&str)->Value {
+    let redacted=String::from_utf8_lossy(bytes).replace(key,"[REDACTED]");
+    json!({"provider":provider,"http_status":status,"request_id":request_id,"outcome":outcome,"body":redacted})
+}
+
 fn usage(provider:&str, v:&Value) -> Option<(u64,u64,u64)> {
     let counts=match provider {
         "openai" => (v["usage"]["input_tokens"].as_u64()?,v["usage"]["output_tokens"].as_u64()?,v["usage"]["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0)),
@@ -109,6 +139,11 @@ mod tests {
         assert_eq!(text("google",&g).unwrap(),"{}"); assert_eq!(usage("google",&g),Some((10,12,0)));
         for p in ["openai","anthropic","google"] {assert!(text(p,&json!({})).is_err());assert!(usage(p,&json!({})).is_none());}
         let mut truncated=o;truncated["status"]=json!("incomplete");assert!(text("openai",&truncated).is_err());
+    }
+    #[test] fn failure_receipts_keep_evidence_without_the_credential() {
+        let v=response_receipt("openai",429,Some("req-test"),"received",br#"{"error":{"code":"rate_limit","message":"key private-credential"}}"#,"private-credential");
+        assert_eq!(v["http_status"],429);assert_eq!(v["request_id"],"req-test");
+        assert!(v["body"].as_str().unwrap().contains("rate_limit"));assert!(!v.to_string().contains("private-credential"));
     }
     #[test] fn request_envelopes_keep_instructions_outside_untrusted_input() {
         for provider in ["openai","anthropic","google"] {

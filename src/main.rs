@@ -25,6 +25,7 @@ mod local;
 mod snapshot;
 mod byok;
 mod fix;
+mod fix_verification;
 mod config;
 mod domain;
 mod error;
@@ -32,6 +33,7 @@ mod git;
 mod github;
 mod github_app;
 mod ignore;
+mod index_progress;
 mod model;
 mod pipeline;
 mod prompts;
@@ -78,7 +80,7 @@ enum Command {
         #[arg(long)] config: PathBuf,
         #[arg(long)] job: PathBuf,
         #[arg(long)] request: PathBuf,
-        #[arg(long, value_parser = ["index", "context", "source", "describe", "fix"])] mode: String,
+        #[arg(long, value_parser = ["index", "index-stats", "context", "source", "describe", "fix", "verify-fix"])] mode: String,
         #[arg(long)] out: PathBuf,
     },
     /// Run a single PR review end to end.
@@ -125,9 +127,10 @@ async fn main() -> ExitCode {
         Err(e) => {
             // Stable, non-sensitive error line for the dispatching API.
             eprintln!("error: {e}");
+            let _ = audit::capture_failure(&e);
             // The API discards stderr, so the usage journal carries the stable
             // code (never the reason) for failures it can explain. Best effort.
-            let _ = telemetry::record(serde_json::json!({"kind": "engine.failed", "code": e.code.as_str()}));
+            let _ = telemetry::record(serde_json::json!({"kind": "engine.failed", "code": e.code.as_str(), "diagnostic_code":e.diagnostic_code()}));
             ExitCode::FAILURE
         }
     }

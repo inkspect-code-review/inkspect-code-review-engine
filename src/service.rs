@@ -1,14 +1,45 @@
 //! CLI operations dispatched by the authenticated API worker. No Go runtime.
-use crate::{config::{HostConfig, ReviewJob}, error::{err, Code, Result}, retrieval::{self, Embedder}, sandbox, git};
+use crate::{config::{HostConfig, ReviewJob}, error::{err, Code, Result}, retrieval::{self, Embedder}, sandbox};
 use serde_json::{json, Value};
 
 pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: Value) -> Result<Value> {
     job.validate()?;
+    if mode == "verify-fix" { return crate::fix::verify_candidate(host, job, request).await; }
     if mode == "fix" { return crate::fix::run(host, job, request).await; }
-    let token = std::env::var("INKSPECT_GITHUB_READ_TOKEN").map_err(|_| err(Code::GitHub, "missing scoped token"))?;
-    let clone = sandbox::clone_pr(&host.sandbox, job, &token).await?;
-    if mode == "describe" {
-        return Ok(json!({"description_sources": description_sources(clone.path(), &job.head_sha, &token).await?}));
+    // Context and source reads use the durable index. Only operations that
+    // acquire new repository content need GitHub credentials or a clone.
+    if mode == "index" || mode == "index-stats" || mode == "describe" {
+        let mut progress = crate::index_progress::IndexProgress::new();
+        if mode == "index" { progress.stage("cloning", "Downloading repository at the selected revision.".into()); }
+        let token = std::env::var("INKSPECT_GITHUB_READ_TOKEN").map_err(|_| err(Code::GitHub, "missing scoped token"))?;
+        let clone = sandbox::clone_pr(&host.sandbox, job, &token).await?;
+        if mode == "describe" {
+            return Ok(json!({"description_sources": description_sources(clone.path(), &job.head_sha, &token).await?}));
+        }
+        if mode == "index-stats" {
+            let policy = crate::ignore::load(clone.path(), &job.head_sha, &token).await?;
+            retrieval::indexer::scan_repository(clone.path(), &job.head_sha, &token, policy.as_ref(), &mut progress).await?;
+            return Ok(json!({"revision":job.head_sha, "scan":progress.scan}));
+        }
+        let rc = &host.retrieval;
+        let bedrock = retrieval::cohere::Bedrock::new(&rc.region, &rc.embed_model, &rc.rerank_region, &rc.rerank_model, rc.dimensions).await?;
+        let qdrant = retrieval::qdrant::Qdrant::from_env()?;
+        let schema = retrieval::Schema::cohere(rc.dimensions);
+        let rev = job.target_revision();
+        let policy = crate::ignore::load(clone.path(), &job.head_sha, &token).await?;
+        let chunks = retrieval::indexer::index_repository(clone.path(), &job.head_sha, &rev, &schema, &bedrock, &qdrant, &token, policy.as_ref(), &mut progress).await?;
+        return Ok(json!({"revision":job.head_sha,"chunks":chunks,"embedded":chunks,"indexed":true,
+            "scan":progress.scan,
+            "description_sources":description_sources(clone.path(), &job.head_sha, &token).await?}));
+    }
+    let rc = &host.retrieval;
+    let qdrant = retrieval::qdrant::Qdrant::from_env()?;
+    let schema = retrieval::Schema::cohere(rc.dimensions);
+    let rev = job.target_revision();
+    let ns = retrieval::Namespace::for_revision(&rev);
+    let manifest = qdrant.manifest(&ns, &schema)?.ok_or_else(|| err(Code::Retrieval, "repository index unavailable"))?;
+    if manifest.revision.as_ref() != Some(&rev) {
+        return Err(err(Code::Retrieval, "indexed revision mismatch"));
     }
     if mode == "source" {
         let path = request["path"].as_str().ok_or_else(|| err(Code::QueueInvalid, "missing path"))?;
@@ -18,27 +49,13 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
         if start > u32::MAX as u64 || end > u32::MAX as u64 || !location.valid() || end - start > 400 {
             return Err(err(Code::QueueInvalid, "invalid source range"));
         }
-        let content = git::read_range(clone.path(), &job.head_sha, path, start as u32, end as u32, &token).await?
-            .ok_or_else(|| err(Code::Source, "source unavailable"))?;
+        let content = qdrant.source(&ns, &schema, &manifest.snapshot, path, start as u32, end as u32)?
+            .ok_or_else(|| err(Code::Source, "saved source unavailable"))?;
         return Ok(json!({"revision": job.head_sha,"path":path,"start_line":start,"end_line":end,"content":content}));
-    }
-    let rc = &host.retrieval;
-    let bedrock = retrieval::cohere::Bedrock::new(&rc.region, &rc.embed_model, &rc.rerank_region, &rc.rerank_model, rc.dimensions).await?;
-    let qdrant = retrieval::qdrant::Qdrant::from_env()?;
-    let schema = retrieval::Schema::cohere(rc.dimensions);
-    let rev = job.target_revision();
-    if mode == "index" {
-        // The policy is read from the indexed commit (the default branch tip),
-        // so excluded files never reach the index. An invalid one fails closed.
-        let policy = crate::ignore::load(clone.path(), &job.head_sha, &token).await?;
-        let chunks = retrieval::indexer::index_repository(clone.path(), &job.head_sha, &rev, &schema, &bedrock, &qdrant, &token, policy.as_ref()).await?;
-        return Ok(json!({"revision":job.head_sha,"chunks":chunks,"embedded":chunks,"indexed":true,
-            "description_sources":description_sources(clone.path(), &job.head_sha, &token).await?}));
     }
     let question = request["question"].as_str().filter(|q| !q.trim().is_empty() && q.len() <= 6000)
         .ok_or_else(|| err(Code::QueueInvalid, "invalid question"))?;
-    let ns = retrieval::Namespace::for_revision(&rev);
-    let manifest = qdrant.manifest(&ns, &schema)?.ok_or_else(|| err(Code::Retrieval, "repository index unavailable"))?;
+    let bedrock = retrieval::cohere::Bedrock::new(&rc.region, &rc.embed_model, &rc.rerank_region, &rc.rerank_model, rc.dimensions).await?;
     let vector = bedrock.embed_query(question)?;
     let inspection = match request.get("retrieval").and_then(Value::as_str) {
         None | Some("lookup") => false,
@@ -55,17 +72,16 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
     let candidate_files = candidates.iter().map(|c| c.path.clone()).collect::<std::collections::HashSet<_>>().len();
     let mut lockfiles_filtered = 0;
     let mut verified = Vec::new();
-    let mut omissions = Vec::new();
+    let omissions: Vec<&str> = Vec::new();
     for chunk in candidates {
         if chunk.key != chunk.computed_key() { return Err(err(Code::Retrieval, "candidate integrity failed")); }
         if inspection && !dependency_question && retrieval::chat::is_lockfile(&chunk.path) {
             lockfiles_filtered += 1;
             continue;
         }
-        match git::read_range(clone.path(), &job.head_sha, &chunk.path, chunk.start_line, chunk.end_line, &token).await? {
-            Some(content) if content == chunk.content => verified.push(chunk),
-            _ => omissions.push("stale candidate"),
-        }
+        // Content and its location are protected by the persisted chunk key
+        // and the namespace/schema/snapshot point identity checked by Qdrant.
+        verified.push(chunk);
     }
     let mut snippets = Vec::new();
     if !verified.is_empty() {

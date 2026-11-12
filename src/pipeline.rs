@@ -276,6 +276,7 @@ async fn retrieve(
                 &qdrant,
                 token,
                 policy,
+                &mut crate::index_progress::IndexProgress::default(),
             )
             .await?;
             tracing::info!(chunks = indexed, "repository indexed");

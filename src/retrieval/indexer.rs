@@ -26,6 +26,7 @@ use super::{chunk_point_id, Chunk, Namespace, Schema};
 use crate::domain::SourceRevision;
 use crate::error::{err, Code, Result};
 use crate::ignore::IgnorePolicy;
+use crate::index_progress::{IndexProgress, Scan};
 
 const CHUNK_LINES: usize = 80;
 const CHUNK_BYTES: usize = 2400;
@@ -47,30 +48,15 @@ pub async fn index_repository(
     qdrant: &Qdrant,
     token: &str,
     ignore: Option<&IgnorePolicy>,
+    progress: &mut IndexProgress,
 ) -> Result<usize> {
     let namespace = Namespace::for_revision(rev);
     let snapshot = snapshot_id(rev, schema);
 
-    // 1. Discover eligible files and build chunks. Paths the repository's
-    //    `.inkspectignore` excludes are never read or embedded.
-    let files = list_tree(repo_dir, head_sha, token).await?;
-    let mut chunks: Vec<Chunk> = Vec::new();
-    for path in files {
-        if !eligible(&path) || ignore.is_some_and(|policy| policy.excluded(&path)) {
-            continue;
-        }
-        let Some(content) = read_blob(repo_dir, head_sha, &path, token).await? else {
-            continue; // binary / unreadable / too large
-        };
-        for c in chunk_file(&path, &content) {
-            chunks.push(c);
-            if chunks.len() > MAX_CHUNKS {
-                return Err(err(Code::Retrieval, "repository exceeds chunk limit"));
-            }
-        }
-    }
+    let chunks = scan_repository(repo_dir, head_sha, token, ignore, progress).await?;
     tracing::info!(chunks = chunks.len(), "indexing repository");
 
+    progress.stage("embedding", format!("Indexing chunks: 0/{} saved.", chunks.len()));
     qdrant.ensure(schema).await?;
 
     // 2 + 3. Embed in batches and upsert chunk points.
@@ -107,19 +93,77 @@ pub async fn index_repository(
             qdrant.upsert(schema, sub.to_vec()).await?;
         }
         embedded += batch.len();
+        progress.embedded = embedded;
+        progress.embedding();
         tracing::info!(embedded, total, "indexing progress");
     }
 
     // 3. Manifest LAST: this is what flips the active snapshot for readers.
+    progress.stage("publishing", "Publishing the completed repository index.".into());
     let manifest = manifest_point(&namespace, schema, &snapshot, rev, chunks.len());
     qdrant.upsert(schema, vec![manifest]).await?;
+    progress.indexed = true;
+    progress.stage("publishing", format!("Index saved: {} chunks. Cleaning up older snapshots.", chunks.len()));
 
     // 4. Remove stale snapshots (best effort; the index is already published).
     if let Err(e) = qdrant.delete_old_snapshots(&namespace, schema, &snapshot).await {
         tracing::warn!(error = %e, "old-snapshot cleanup failed (index is still published)");
     }
 
+    progress.stage("summarizing", "Index saved. Preparing the repository description.".into());
     Ok(chunks.len())
+}
+
+/// Count files with exactly the same filters and chunking as a full index.
+/// Used to repair old counters without embedding or writing vector points.
+pub async fn scan_repository(
+    repo_dir: &Path,
+    head_sha: &str,
+    token: &str,
+    ignore: Option<&IgnorePolicy>,
+    progress: &mut IndexProgress,
+) -> Result<Vec<Chunk>> {
+    // 1. Discover eligible files and build chunks. Paths the repository's
+    //    `.inkspectignore` excludes are never read or embedded.
+    progress.stage("discovering", "Scanning repository files.".into());
+    let files = list_tree(repo_dir, head_sha, token).await?;
+    progress.scan = Scan { measured: true, stage: "reading".into(), total: files.len(), ..Scan::default() };
+    progress.stage("discovering", format!("Scanning files: {} found.", files.len()));
+    progress.stage("reading", "Reading repository files.".into());
+    let mut chunks: Vec<Chunk> = Vec::new();
+    for path in files {
+        if !eligible(&path) || ignore.is_some_and(|policy| policy.excluded(&path)) {
+            collect_file(&path, None, &mut chunks, progress)?;
+            continue;
+        }
+        let content = read_blob(repo_dir, head_sha, &path, token).await?;
+        collect_file(&path, content.as_deref(), &mut chunks, progress)?;
+    }
+    progress.scan.stage = "completed".into();
+    progress.reading(true);
+    Ok(chunks)
+}
+
+fn collect_file(path: &str, content: Option<&str>, chunks: &mut Vec<Chunk>, progress: &mut IndexProgress) -> Result<()> {
+    progress.scan.processed += 1;
+    if let Some(content) = content {
+        progress.scan.read += 1;
+        let file_chunks = chunk_file(path, content);
+        // "read" counts safe text files loaded, including empty files;
+        // "skipped" counts files that contribute no searchable chunks.
+        if file_chunks.is_empty() { progress.scan.skipped += 1; }
+        for c in file_chunks {
+            chunks.push(c);
+            if chunks.len() > MAX_CHUNKS {
+                return Err(err(Code::Retrieval, "repository exceeds chunk limit"));
+            }
+        }
+    } else {
+        progress.scan.skipped += 1;
+    }
+    progress.chunks = chunks.len();
+    progress.reading(false);
+    Ok(())
 }
 
 /// Opaque snapshot id for a repository index: hash of the indexed commit and
@@ -368,6 +412,22 @@ fn has_token_prefix(s: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_counts_read_and_omitted_files_without_inventing_chunks() {
+        let mut progress = IndexProgress::default();
+        let mut chunks = Vec::new();
+        collect_file("code.rs", Some("fn main() {}\n"), &mut chunks, &mut progress).unwrap();
+        collect_file("binary.rs", None, &mut chunks, &mut progress).unwrap();
+        collect_file("empty.rs", Some(" \n"), &mut chunks, &mut progress).unwrap();
+        collect_file("long.rs", Some(&"x".repeat(CHUNK_BYTES + 1)), &mut chunks, &mut progress).unwrap();
+        assert_eq!(progress.scan.processed, 4);
+        assert_eq!(progress.scan.read, 3);
+        assert_eq!(progress.scan.skipped, 3);
+        assert_eq!(progress.chunks, 1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].path, "code.rs");
+    }
 
     #[test]
     fn windows_overlap_and_skip_blank() {

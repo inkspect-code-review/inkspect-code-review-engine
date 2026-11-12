@@ -11,6 +11,21 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-12
+
+#### Added
+
+- Independent repair verification with source evidence, candidate-bound receipts,
+  bounded refinement attempts, and explicit reporting when no safe repair exists.
+- Atomic indexing progress snapshots with file and chunk counters.
+
+#### Changed
+
+- Reuse saved review repair instructions and record generation and verification
+  usage separately, with operation-wide request and cost limits.
+- Serve source ranges and retrieval results from validated saved index snapshots
+  without requiring a new repository checkout.
+
 ### 2026-11-06
 
 #### Added

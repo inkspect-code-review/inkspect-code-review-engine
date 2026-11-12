@@ -20,6 +20,7 @@ mod review_pipeline_tests;
 /// Resolved manifest describing the current index snapshot for a repository.
 pub struct Manifest {
     pub snapshot: String,
+    pub revision: Option<crate::domain::SourceRevision>,
 }
 
 pub struct Qdrant {
@@ -128,6 +129,8 @@ impl Qdrant {
         }
         Ok(Some(Manifest {
             snapshot: snapshot.to_string(),
+            revision: point.payload.get("revision").cloned().map(serde_json::from_value).transpose()
+                .map_err(|_| err(Code::Retrieval, "invalid manifest revision"))?,
         }))
     }
 
@@ -223,6 +226,37 @@ impl Qdrant {
             chunks.push(chunk);
         }
         Ok(chunks)
+    }
+
+    /// Read an exact cited chunk from the saved snapshot without GitHub.
+    pub fn source(&self, ns: &Namespace, schema: &Schema, snapshot: &str, path: &str, start: u32, end: u32) -> Result<Option<String>> {
+        let route = format!("{}/points/scroll", self.collection_route(schema));
+        let body = serde_json::json!({"limit": 1, "with_payload": true, "with_vector": false,
+            "filter": {"must": [
+                {"key":"kind","match":{"value":"chunk"}},
+                {"key":"namespace.tenant","match":{"value":ns.tenant}},
+                {"key":"namespace.repository","match":{"value":ns.repository}},
+                {"key":"embedding_schema.model","match":{"value":schema.model}},
+                {"key":"embedding_schema.version","match":{"value":schema.version}},
+                {"key":"embedding_schema.dimensions","match":{"value":schema.dimensions}},
+                {"key":"snapshot","match":{"value":snapshot}},
+                {"key":"chunk.path","match":{"value":path}},
+                {"key":"chunk.start_line","match":{"value":start}},
+                {"key":"chunk.end_line","match":{"value":end}}
+            ]}});
+        let result = block_on(self.post(&route, &body))?;
+        if result.is_null() { return Ok(None); }
+        let result: QueryResult = serde_json::from_value(result).map_err(|_| err(Code::Retrieval, "source decode failed"))?;
+        if result.points.len() > 1 { return Err(err(Code::Retrieval, "too many source chunks")); }
+        let Some(point) = result.points.into_iter().next() else { return Ok(None); };
+        let chunk = Chunk {key:field_str(&point.payload["chunk"],"key")?,path:path.into(),start_line:start,end_line:end,
+            file_sha256:String::new(),content:field_str(&point.payload,"content")?};
+        if point.payload["kind"] != "chunk" || point.payload["chunk"]["path"] != path
+            || point.payload["chunk"]["start_line"] != start || point.payload["chunk"]["end_line"] != end
+            || chunk.key != chunk.computed_key() || point.id != chunk_point_id(ns,schema,snapshot,&chunk.key) {
+            return Err(err(Code::Retrieval, "saved source integrity failed"));
+        }
+        Ok(Some(chunk.content))
     }
 
     // ---- Write path (repository indexing) --------------------------------
@@ -492,5 +526,52 @@ mod group_tests {
         assert!(query_points(json!({"groups":[bad]}),true,2).is_err());
         let mut bad=group("a"); bad["hits"]=json!([]);
         assert!(query_points(json!({"groups":[bad]}),true,2).is_err());
+    }
+
+    #[tokio::test(flavor="multi_thread", worker_threads=2)]
+    async fn saved_sources_read_scoped_content_and_reject_tampering() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let ns = Namespace { tenant:"tenant-hash".into(), repository:"repo-hash".into() };
+        let schema = Schema::cohere(1024);
+        let mut chunk = Chunk { key:String::new(), path:"src/a.ts".into(), start_line:10, end_line:11,
+            file_sha256:String::new(), content:"saved code\nsecond line\n".into() };
+        chunk.key = chunk.computed_key();
+        let point = json!({"id":chunk_point_id(&ns,&schema,"snapshot",&chunk.key),
+            "payload":{"kind":"chunk","chunk":{"key":chunk.key,"path":chunk.path,"start_line":10,"end_line":11},"content":chunk.content}});
+        let mut tampered = point.clone(); tampered["payload"]["content"] = json!("changed code");
+        let mut foreign = point.clone(); foreign["id"] = json!(chunk_point_id(&Namespace { tenant:"other".into(), repository:ns.repository.clone() },&schema,"snapshot",&chunk.key));
+        let server = std::thread::spawn(move || {
+            for points in [json!([point]), json!([tampered]), json!([foreign]), json!([])] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new(); let mut buffer = [0;4096];
+                let end = loop {
+                    let n = stream.read(&mut buffer).unwrap(); assert!(n > 0); bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") { break i+4; }
+                };
+                let header = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                assert!(header.contains("/points/scroll "));
+                let length = header.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap();
+                while bytes.len() < end+length { let n=stream.read(&mut buffer).unwrap(); assert!(n>0); bytes.extend_from_slice(&buffer[..n]); }
+                let body:serde_json::Value = serde_json::from_slice(&bytes[end..end+length]).unwrap();
+                let filters = body["filter"]["must"].as_array().unwrap();
+                assert_eq!(body["limit"], 1);
+                assert_eq!(filters.len(), 10);
+                for (key, value) in [("namespace.tenant",json!("tenant-hash")),("namespace.repository",json!("repo-hash")),
+                    ("snapshot",json!("snapshot")),("chunk.path",json!("src/a.ts")),("chunk.start_line",json!(10)),("chunk.end_line",json!(11))] {
+                    assert!(filters.contains(&json!({"key":key,"match":{"value":value}})));
+                }
+                let response = json!({"status":"ok","result":{"points":points}}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}",response.len(),response).unwrap();
+            }
+        });
+        let client = Qdrant { endpoint, api_key:None, client:reqwest::Client::new() };
+        assert_eq!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).unwrap(),Some(chunk.content));
+        assert!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).is_err());
+        assert!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).is_err());
+        assert!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).unwrap().is_none());
+        server.join().unwrap();
     }
 }

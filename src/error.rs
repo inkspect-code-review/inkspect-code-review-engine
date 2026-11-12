@@ -30,6 +30,10 @@ pub enum Code {
     /// The model call failed, timed out, was truncated, or returned a response
     /// that did not match the required schema.
     Model,
+    /// The independent repair verifier could not establish a complete fix.
+    FixVerification,
+    /// The generator explicitly returned no safe repair, not a provider failure.
+    FixNoSafeRepair,
     /// Publishing the review to GitHub failed.
     Publish,
     /// An unexpected internal invariant was violated.
@@ -47,6 +51,8 @@ impl Code {
             Code::IgnoreInvalid => "source.invalid_ignore",
             Code::Retrieval => "retrieval.invalid",
             Code::Model => "model.failed",
+            Code::FixVerification => "fix.verification_failed",
+            Code::FixNoSafeRepair => "fix.no_safe_repair",
             Code::Publish => "publish.failed",
             Code::Internal => "internal.error",
         }
@@ -69,6 +75,32 @@ pub struct EngineError {
 }
 
 impl EngineError {
+    // Only engine-owned categories reach public diagnostics. Never derive one
+    // from provider prose, source text, paths or a model's explanation.
+    pub fn diagnostic_code(&self) -> &'static str {
+        match self.reason.as_str() {
+            "generator could not propose a complete safe repair" => "fix.no_safe_repair",
+            "invalid repair response" => "fix.invalid_response",
+            "repair anchor is missing or ambiguous" => "fix.anchor_mismatch",
+            "repair must address every finding" => "fix.incomplete_findings",
+            "repair path outside supplied scope" => "fix.out_of_scope",
+            "invalid repaired content" => "fix.invalid_content",
+            "invalid repair inability explanation" => "fix.invalid_response",
+            "empty or oversized repair" | "empty or oversized cumulative candidate" => "fix.invalid_size",
+            "repair repeated a rejected candidate" => "fix.repeated_candidate",
+            "repair attempt limit reached without verified closure" => "fix.attempt_limit",
+            "repair context exceeds operation budget" | "verification context exceeds operation budget" | "repair loop cannot fit operation budget" => "fix.budget_limit",
+            "independent verification did not establish a complete safe fix" => "fix.invalid_verdict",
+            "converse call failed" | "provider request failed" => "model.request_failed",
+            "provider rejected the request" => "model.request_rejected",
+            "model response was truncated or refused" | "provider response incomplete or refused" => "model.incomplete_response",
+            "provider response interrupted" => "model.interrupted_response",
+            "model response too large" | "provider response too large" => "model.oversized_response",
+            "malformed model output" | "unexpected response role" | "invalid provider response" => "model.invalid_response",
+            "review context could not be saved" => "audit.write_failed",
+            _ => self.code.as_str(),
+        }
+    }
     pub fn new(code: Code, reason: impl Into<String>) -> Self {
         Self {
             code,
