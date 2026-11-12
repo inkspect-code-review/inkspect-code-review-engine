@@ -43,6 +43,7 @@ mod retrieval;
 mod review;
 mod sandbox;
 mod service;
+mod setup;
 mod telemetry;
 
 use clap::{Parser, Subcommand};
@@ -60,6 +61,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prepare a private local-review configuration; call a provider only with --run.
+    Setup(setup::SetupOptions),
+    /// Pass an environment-held provider key to a review through a private pipe.
+    WithProvider {
+        #[command(flatten)] provider: setup::ProviderOptions,
+        /// Review command and arguments, after -- (local, review or snapshot).
+        #[arg(last = true, required = true)] args: Vec<std::ffi::OsString>,
+    },
+    /// Resolve a GitHub PR into a pinned job using the authenticated GitHub CLI.
+    PrepareJob(setup::JobOptions),
     /// Review an inline before/after snapshot and task criteria without a repository.
     Snapshot {
         #[arg(long)] config: PathBuf,
@@ -138,6 +149,17 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> error::Result<()> {
     match cli.command {
+        Command::Setup(options) => setup::prepare(options),
+        Command::PrepareJob(options) => setup::prepare_job(options),
+        Command::WithProvider { provider, args } => {
+            // Validate the complete child command before reading credentials.
+            let child = Cli::try_parse_from(std::iter::once(std::ffi::OsString::from("inkspect-engine")).chain(args.iter().cloned()))
+                .map_err(|_| error::err(error::Code::QueueInvalid, "expected a valid local, review or snapshot command after --"))?;
+            if !matches!(child.command, Command::Local { .. } | Command::Review { .. } | Command::Snapshot { .. }) {
+                return Err(error::err(error::Code::QueueInvalid, "only local, review and snapshot may use with-provider"));
+            }
+            setup::launch(&provider, &args)
+        },
         Command::Snapshot { config, request, out } => {
             let host: HostConfig = load_json(&config, "host config")?;
             let input: snapshot::Input = load_json(&request, "inline snapshot")?;

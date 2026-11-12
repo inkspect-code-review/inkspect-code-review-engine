@@ -21,6 +21,11 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 #### Changed
 
+- Replace Python setup and launcher scripts with native Rust `setup`,
+  `with-provider` and `prepare-job` commands and a small shell build wrapper.
+  Keep direct-provider keys on a private pipe to the review subprocess, preserve
+  setup-only behavior and private config permissions, and update local, Docker,
+  agent and CI instructions. Move setup regression coverage into Cargo tests.
 - Reuse saved review repair instructions and record generation and verification
   usage separately, with operation-wide request and cost limits.
 - Serve source ranges and retrieval results from validated saved index snapshots

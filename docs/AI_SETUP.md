@@ -13,7 +13,7 @@ change your Git history, expose a port, or spend money without your request.
    credentials are needed to clone the public engine repository.
 2. **Read project instructions.** Follow any applicable `AGENTS.md` and the user's
    constraints. Inspect this engine's README and `--help`; do not invent flags.
-3. **Check prerequisites.** Git, Python 3, Rust 1.94.1+ and the platform's native
+3. **Check prerequisites.** Git, Rust 1.94.1+ and the platform's native
    build tools are needed. Install missing tools through the user's normal package
    manager or the official Rust installer, within their granted permissions.
    Do not use sudo, modify global configuration, or run downloaded install scripts
@@ -49,10 +49,13 @@ change your Git history, expose a port, or spend money without your request.
 
 ## Setup helper
 
-Run from the engine checkout, replacing the project path and model ID:
+Run from the engine checkout, replacing the project path and model ID. The
+POSIX shell wrapper builds the Rust CLI and invokes its native `setup` command.
+No Python, Node.js or jq is required. Cargo checks the minimum Rust version;
+missing compiler/native build tools are reported by the build:
 
 ```sh
-python3 scripts/ai-setup.py \
+sh scripts/ai-setup.sh \
   --repo /absolute/path/to/project \
   --provider openai \
   --model YOUR_MODEL_ID
@@ -61,7 +64,7 @@ python3 scripts/ai-setup.py \
 Once `OPENAI_API_KEY` is available privately and a review is authorized:
 
 ```sh
-python3 scripts/ai-setup.py \
+sh scripts/ai-setup.sh \
   --repo /absolute/path/to/project \
   --provider openai \
   --model YOUR_MODEL_ID \
@@ -77,7 +80,21 @@ Add `--base main` only when the user wants changes against that local branch.
 The helper writes config and reports under a new `.local/agent-review-*`
 directory for each invocation. It prints a small JSON receipt with paths, provider,
 model and whether the review ran. It never saves the provider key. Direct keys
-are removed from the engine's environment and passed only through stdin.
+are removed from the build and review subprocess environments and passed to the
+review only through stdin. An inherited `INKSPECT_BYOK_STDIN` flag cannot select a
+different provider. Bedrock preserves the AWS credential chain.
+
+With a built binary, `inkspect-engine setup` accepts the same flags and does not
+need Cargo at runtime. Its default output parent is `.local` in the current
+directory; `--output-dir` selects another existing parent or creates its final
+component. Existing parents must be private (mode 0700) and not symlinks. New
+per-run directories are mode 0700 and configs mode 0600. Windows users should use
+WSL for these Unix permission guarantees.
+
+To reuse a config for subsequent reviews, use `inkspect-engine with-provider` as
+documented in the README. It supports local, PR and inline snapshot reviews. The
+`prepare-job` command replaces hand-written PR metadata scripts and requires
+only the authenticated GitHub CLI in addition to the engine.
 
 ## A prompt you can give your agent
 

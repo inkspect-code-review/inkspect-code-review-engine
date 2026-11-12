@@ -32,11 +32,14 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-rust-1.94.1-${{ hashFiles('Cargo.lock') }}
-      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo +1.94.1 test --locked
       - run: cargo +1.94.1 build --locked
       - run: ./target/debug/inkspect-engine --help
       - run: ./target/debug/inkspect-engine local --help
+      - run: ./target/debug/inkspect-engine setup --help
+      - run: ./target/debug/inkspect-engine with-provider --help
+      - run: ./target/debug/inkspect-engine prepare-job --help
+      - run: sh -n scripts/ai-setup.sh
       - name: Validate Compose
         if: runner.os == 'Linux'
         run: docker compose --profile review --profile context config --quiet
@@ -47,13 +50,12 @@ jobs:
     timeout-minutes: 2
     steps:
       - name: Check conventional title
+        shell: bash
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          python3 - <<'PY'
-          import os, re
-          title = os.environ['PR_TITLE']
-          pattern = r'(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)\([a-z0-9-]+\)!?: [a-z].+'
-          if not re.fullmatch(pattern, title) or len(title) > 72 or title.endswith('.'):
-              raise SystemExit('Use type(scope): short imperative description (max 72 characters).')
-          PY
+          pattern='^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)\([a-z0-9-]+\)!?: [a-z].+$'
+          if [[ ! "$PR_TITLE" =~ $pattern || ${#PR_TITLE} -gt 72 || "$PR_TITLE" == *. || "$PR_TITLE" == *$'\n'* || "$PR_TITLE" == *$'\r'* ]]; then
+            printf '%s\n' 'Use type(scope): short imperative description (max 72 characters).' >&2
+            exit 1
+          fi

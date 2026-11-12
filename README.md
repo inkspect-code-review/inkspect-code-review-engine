@@ -58,10 +58,12 @@ Give your coding agent [this setup guide](docs/AI_SETUP.md), or ask:
 > then run the review and summarize findings. Do not modify or publish my code.
 
 The guide helps the agent check prerequisites, build the CLI, select a provider,
-prepare exclusions/config and run the review. A setup helper is included:
+prepare exclusions/config and run the review. The shell helper builds the Rust
+CLI and invokes its native `setup` command; no Python or other scripting runtime
+is required. Rust/Cargo enforces the minimum version during the build:
 
 ```sh
-python3 scripts/ai-setup.py \
+sh scripts/ai-setup.sh \
   --repo /absolute/path/to/project --provider openai --model YOUR_MODEL_ID
 ```
 
@@ -69,7 +71,11 @@ Without `--run`, it only prepares the environment; no model call is made. Add
 `--run` when you want a review and have set `OPENAI_API_KEY` privately. Anthropic
 uses `ANTHROPIC_API_KEY`, Google uses `GEMINI_API_KEY`, and Bedrock uses your AWS
 credentials. Use `--max-output-tokens` if your model needs a lower output cap.
-See the guide for the full workflow and a setup-only prompt.
+See the guide for the full workflow and a setup-only prompt. With an already
+built binary, use `inkspect-engine setup` with the same options; `--output-dir`
+selects the private parent directory (default `.local` in the current directory).
+The shell helper uses `.local` in the engine checkout. Existing parent directories
+must have mode 0700; setup never changes an existing directory's permissions.
 
 ## 1. Install the engine
 
@@ -83,7 +89,6 @@ Install these tools first:
 | Rust **1.94.1 or newer**, including Cargo | Builds the engine. |
 | Git | Downloads repository contents for review. |
 | GitHub CLI (`gh`), optional | Only needed for the GitHub PR examples. Local reviews do not need it. |
-| Python 3 | Generates configuration input and securely passes provider keys in the examples. |
 | A native C/C++ build toolchain and CMake | Builds native dependencies if required by your platform. |
 
 Check your installations:
@@ -93,7 +98,6 @@ rustc --version
 cargo --version
 git --version
 gh --version
-python3 --version
 ```
 
 Download the repository and build the executable:
@@ -165,8 +169,8 @@ Bedrock, use:
   --out .local/report.md
 ```
 
-For OpenAI, Anthropic or Google, use the Python launcher in Option B with the
-local command shown there. You do not need a GitHub token, PR, job JSON, Qdrant
+For OpenAI, Anthropic or Google, use the native `with-provider` command in
+Option B. You do not need a GitHub token, PR, job JSON, Qdrant
 or PostgreSQL for local reviews.
 
 | Folder | What gets reviewed |
@@ -219,42 +223,15 @@ Run this block to create `.local/job.json`. It asks GitHub for the repository ID
 and current commit IDs, so you do not need to copy them by hand:
 
 ```sh
-python3 - <<'PY'
-import json
-import os
-import pathlib
-import subprocess
-import uuid
-
-repository = os.environ["REVIEW_REPOSITORY"]
-number = int(os.environ["REVIEW_PR"])
-owner, name = repository.split("/")
-
-def github(path):
-    return json.loads(subprocess.check_output(["gh", "api", path], text=True))
-
-repo = github(f"repos/{repository}")
-pr = github(f"repos/{repository}/pulls/{number}")
-base_tip, head = pr["base"]["sha"], pr["head"]["sha"]
-comparison = github(f"repos/{repository}/compare/{base_tip}...{head}?per_page=1")
-job = {
-    "run_id": "J-" + uuid.uuid4().hex,
-    "owner": owner,
-    "repo": name,
-    "repository_id": str(repo["id"]),
-    "tenant_id": "my-local-workspace",
-    "pull_number": number,
-    "base_sha": comparison["merge_base_commit"]["sha"],
-    "head_sha": head,
-    "head_ref": pr["head"]["ref"],
-    "review_notes": [],
-    "publish_inline_comments": False,
-    "auto_review": False,
-}
-pathlib.Path(".local/job.json").write_text(json.dumps(job, indent=2) + "\n")
-print("Created .local/job.json")
-PY
+./target/release/inkspect-engine prepare-job \
+  --repository "$REVIEW_REPOSITORY" --pull "$REVIEW_PR" \
+  --out .local/job.json
 ```
+
+This uses your authenticated `gh` CLI against github.com. The output is private
+(mode 0600); an existing job is never overwritten. To refresh a job, choose a
+new `--out` path or remove the old job first. The parent directory must be private
+(mode 0700). `--tenant` defaults to `my-local-workspace`.
 
 A *merge base* is the common commit from which the two branches diverged. The
 engine reviews changes between that commit and the PR's current head.
@@ -311,54 +288,44 @@ Then run:
 
 ### Option B: OpenAI, Anthropic, or Google
 
-Direct-provider support currently receives credentials through **standard input**,
-not through a provider field in `host.json`. The block below saves a small Python
-launcher in `.local/review.py` and runs it. The launcher prompts
-for your provider, model ID and key, then passes them to the engine without
-saving the key to a file or including it in command-line arguments.
+The native `with-provider` launcher reads the selected key from your environment,
+then starts a review subprocess with credential JSON on a private stdin pipe.
+It removes all three direct-provider key variables from the child environment;
+keys never enter config files or command-line arguments. Existing integrations
+can continue to provide credential JSON on stdin with `INKSPECT_BYOK_STDIN=1`.
 
-Keep retrieval disabled for this first run; you do not need AWS credentials for
-a direct-provider review without retrieval.
+Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY` privately through
+your secret manager or terminal. Never paste a key into chat or a shell command
+that will be saved in history. For an interactive Bash prompt, for example:
 
-```sh
-cat > .local/review.py <<'PY'
-import getpass
-import json
-import os
-import subprocess
-
-provider = input("Provider (openai / anthropic / google): ").strip()
-if provider not in {"openai", "anthropic", "google"}:
-    raise SystemExit("Choose openai, anthropic, or google.")
-model = input("Model ID from your provider account: ").strip()
-if not model:
-    raise SystemExit("A model ID is required.")
-credential = {
-    "provider": provider,
-    "model": model,
-    "api_key": getpass.getpass("API key (hidden): "),
-    "max_output_tokens": 8192,
-}
-environment = {**os.environ, "INKSPECT_BYOK_STDIN": "1"}
-result = subprocess.run(
-    ["./target/release/inkspect-engine", "local",
-     "--config", ".local/host.json", "--repo", "/absolute/path/to/your-project",
-     "--format", "markdown", "--out", ".local/report.md"],
-    input=json.dumps(credential), text=True, env=environment,
-)
-raise SystemExit(result.returncode)
-PY
-python3 .local/review.py
+```bash
+read -r -s -p 'OpenAI API key: ' OPENAI_API_KEY
+printf '\n'
+export OPENAI_API_KEY
 ```
 
-Before running the launcher, replace `/absolute/path/to/your-project` with your
-folder. To review a GitHub PR instead, change `"local"` to `"review"` and replace
-`"--repo", "/absolute/path/to/your-project"` with `"--job", ".local/job.json"`.
+Keep retrieval disabled for this first run; a direct-provider review without
+retrieval does not need AWS credentials. Run a local review:
 
-Use a model ID that your own provider account can access. If its output limit is
-below `8192`, lower `max_output_tokens` above and `model_max_output_tokens` in the
-host config. The smaller of those two limits is used. There is no automatic
-fallback to a different provider or model.
+```sh
+./target/release/inkspect-engine with-provider \
+  --provider openai --model YOUR_MODEL_ID -- \
+  local --config .local/host.json --repo /absolute/path/to/your-project \
+  --format markdown --out .local/report.md
+```
+
+For a GitHub PR, replace `local --repo /absolute/path/to/your-project` with
+`review --job .local/job.json`, keeping the config and output options. The launcher
+also accepts `snapshot`. It rejects other subcommands and never retries a failed
+review. Use `--provider anthropic` or `--provider google` for the other keys.
+Bedrock uses the ordinary review commands and the model/region in the host config.
+
+Use a model ID your own provider account can access. If its output limit is
+below `8192`, add `--max-output-tokens` before `--` and lower
+`model_max_output_tokens` in the host config. The smaller limit is used.
+There is no automatic provider or model fallback. Unset the key variable after
+use if it is no longer needed. The parent launcher's environment is still sensitive;
+do not dump it to logs.
 
 The engine uses OpenAI Responses, Anthropic Messages, or Google GenerateContent.
 API keys are passed only to the selected provider's fixed HTTPS endpoint.
@@ -491,14 +458,21 @@ directory on Linux. The process has a read-only root filesystem and bounded
 writable temporary storage. AWS profiles from your host are not automatically
 mounted: pass session credentials or a Bedrock API key to the container.
 
-For direct providers, pass the credential through stdin. The following example
-asks for an OpenAI key without saving it; change `provider` and `model` as needed:
+For direct providers, use the same native launcher inside the container. Supply
+`OPENAI_API_KEY` privately in your host environment first; `-e OPENAI_API_KEY`
+forwards its value without placing it in the command arguments:
 
 ```sh
-python3 -c 'import getpass,json; print(json.dumps({"provider":"openai","model":"YOUR_MODEL_ID","api_key":getpass.getpass("API key: "),"max_output_tokens":8192}))' | \
-  docker compose run --rm -T -e INKSPECT_BYOK_STDIN=1 engine local \
-    --config /config/host.json --repo /workspace --out /reports/report.md
+docker compose run --rm -T -e OPENAI_API_KEY engine with-provider \
+  --provider openai --model YOUR_MODEL_ID -- \
+  local --config /config/host.json --repo /workspace --out /reports/report.md
 ```
+
+For Anthropic or Google, change both the environment variable and `--provider`.
+The launcher removes direct-provider keys from the review subprocess environment
+and supplies the selected key on stdin. The container configuration still contains
+the forwarded environment value and must be accessible only to trusted operators.
+No host Python, Node.js, jq or Rust installation is needed for the Docker workflow.
 
 To add Qdrant for **GitHub PR context**, start the context profile:
 
@@ -534,8 +508,8 @@ For an unattended runner:
 
 1. Build the binary and install Git in the runtime environment.
 2. Supply GitHub and provider credentials from the runner's secret store. For
-   direct providers, have your launcher pass the credential JSON on stdin with
-   `INKSPECT_BYOK_STDIN=1`, as in the example above.
+   direct providers, use `with-provider`, or pass credential JSON on stdin with
+   `INKSPECT_BYOK_STDIN=1` from an existing integration.
 3. For GitHub reviews, generate a fresh job from the PR event or current metadata.
    For local reviews, mount the project read-only and pass its path with `--repo`.
 4. Keep the host config under operator control, outside the reviewed PR's control.

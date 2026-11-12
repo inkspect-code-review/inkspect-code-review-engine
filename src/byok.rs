@@ -18,14 +18,17 @@ impl Provider {
         if std::env::var("INKSPECT_BYOK_STDIN").ok().as_deref() != Some("1") { return Ok(None); }
         let mut bytes = Vec::new();
         std::io::stdin().take(8193).read_to_end(&mut bytes).map_err(|_| err(Code::Model,"credential pipe unavailable"))?;
-        let parsed = serde_json::from_slice::<Self>(&bytes);
-        let bounded = bytes.len() <= 8192; bytes.fill(0);
-        let p = parsed.map_err(|_| err(Code::Model,"invalid provider credentials"))?;
-        if !bounded || !["openai","anthropic","google"].contains(&p.provider.as_str()) || p.model.is_empty() || p.model.len()>100
+        let parsed = Self::decode(&bytes);
+        bytes.fill(0);
+        parsed.map(Some)
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        let p: Self = serde_json::from_slice(bytes).map_err(|_| err(Code::Model,"invalid provider credentials"))?;
+        if bytes.len() > 8192 || !["openai","anthropic","google"].contains(&p.provider.as_str()) || p.model.is_empty() || p.model.len()>100
             || !p.model.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
             || !(16..=4096).contains(&p.api_key.len()) || !p.api_key.bytes().all(|b| (33..=126).contains(&b))
             || !(1..=16384).contains(&p.max_output_tokens) {return Err(err(Code::Model,"invalid provider credentials"));}
-        Ok(Some(p))
+        Ok(p)
     }
     fn payload(&self, system: &str, user: &str, max: i32) -> (&'static str, Value) {
         match self.provider.as_str() {
