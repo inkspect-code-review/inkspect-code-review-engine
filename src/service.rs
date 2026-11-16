@@ -27,7 +27,7 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
         let schema = retrieval::Schema::cohere(rc.dimensions);
         let rev = job.target_revision();
         let policy = crate::ignore::load(clone.path(), &job.head_sha, &token).await?;
-        let chunks = retrieval::indexer::index_repository(clone.path(), &job.head_sha, &rev, &schema, &bedrock, &qdrant, &token, policy.as_ref(), &mut progress).await?;
+        let chunks = retrieval::indexer::index_repository(clone.path(), &job.head_sha, &rev, &schema, &bedrock, &qdrant, &token, policy.as_ref(), &mut progress, host.index_max_input_bytes).await?;
         return Ok(json!({"revision":job.head_sha,"chunks":chunks,"embedded":chunks,"indexed":true,
             "scan":progress.scan,
             "description_sources":description_sources(clone.path(), &job.head_sha, &token).await?}));

@@ -49,11 +49,13 @@ pub async fn index_repository(
     token: &str,
     ignore: Option<&IgnorePolicy>,
     progress: &mut IndexProgress,
+    max_input_bytes: usize,
 ) -> Result<usize> {
     let namespace = Namespace::for_revision(rev);
     let snapshot = snapshot_id(rev, schema);
 
     let chunks = scan_repository(repo_dir, head_sha, token, ignore, progress).await?;
+    check_input_budget(&chunks, max_input_bytes)?;
     tracing::info!(chunks = chunks.len(), "indexing repository");
 
     progress.stage("embedding", format!("Indexing chunks: 0/{} saved.", chunks.len()));
@@ -446,5 +448,28 @@ mod tests {
         assert!(!eligible("node_modules/x/index.js"));
         assert!(!eligible("secrets.env.local.json"));
         assert!(!eligible("assets/foo.png"));
+    }
+}
+
+fn check_input_budget(chunks: &[Chunk], limit: usize) -> Result<()> {
+    let bytes = chunks.iter().map(|c| c.input().len()).sum::<usize>();
+    if limit > 0 && bytes > limit {
+        return Err(err(Code::Retrieval, "repository exceeds indexing input allowance"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn input_allowance_is_checked_before_embedding_and_counts_metadata() {
+        let mut chunk = Chunk { path:"src/a.rs".into(), start_line:1, end_line:1,
+            content:"fn main() {}".into(), file_sha256:String::new(), key:String::new() };
+        chunk.key=chunk.computed_key();
+        let exact=chunk.input().len();
+        assert!(check_input_budget(&[chunk.clone()],exact).is_ok());
+        assert!(check_input_budget(&[chunk.clone()],exact-1).is_err());
+        assert!(check_input_budget(&[chunk],0).is_ok());
     }
 }

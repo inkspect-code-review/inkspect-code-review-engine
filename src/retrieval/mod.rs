@@ -205,13 +205,28 @@ impl<'a> Pipeline<'a> {
         focus: &str,
         changed: &[ChangedFile],
     ) -> Result<Vec<Retrieved>> {
+        self.enrich_checked(rev, focus, changed, false)
+    }
+
+    /// A strict caller must not use a manifest replaced by a concurrent index.
+    pub fn enrich_current(&self, rev: &SourceRevision, focus: &str, changed: &[ChangedFile]) -> Result<Vec<Retrieved>> {
+        self.enrich_checked(rev, focus, changed, true)
+    }
+
+    fn enrich_checked(&self, rev: &SourceRevision, focus: &str, changed: &[ChangedFile], require_current: bool) -> Result<Vec<Retrieved>> {
         let namespace = Namespace::for_revision(rev);
 
         // Read the manifest. If no shared index exists we simply skip RAG; the
         // single model call still runs on the diff and changed-file context.
         let manifest = match self.qdrant.manifest(&namespace, &self.schema)? {
-            Some(m) => m,
+            Some(m) => {
+                if require_current && m.revision.as_ref() != Some(rev) {
+                    return Err(err(Code::Retrieval, "repository index revision changed"));
+                }
+                m
+            },
             None => {
+                if require_current { return Err(err(Code::Retrieval, "repository index unavailable")); }
                 tracing::info!("no repository index; proceeding without RAG context");
                 return Ok(Vec::new());
             }

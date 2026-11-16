@@ -37,6 +37,13 @@ pub struct HostConfig {
     pub output_nano_usd: u64,
     #[serde(default)]
     pub budget_nano_usd: u64,
+    /// Require a current index and successful retrieval; never silently fall back.
+    #[serde(default)]
+    pub require_indexed_context: bool,
+    /// Operator ceiling on embedding input bytes, checked before any index call.
+    /// Zero preserves the normal repository limits.
+    #[serde(default)]
+    pub index_max_input_bytes: usize,
     /// Retrieval (RAG) configuration. Matches the Go `retrieval.Config`.
     pub retrieval: RetrievalConfig,
     /// Sandbox resource limits for the clone container.

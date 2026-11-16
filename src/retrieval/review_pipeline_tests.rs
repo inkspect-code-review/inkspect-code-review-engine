@@ -48,7 +48,7 @@ async fn review_ranks_all_verified_candidates_in_batches_and_ignores_chat_top_n(
     let points: Vec<_> = chunks.iter().map(|c| json!({"id":chunk_point_id(&ns,&schema,"snapshot",&c.key),
         "payload":{"kind":"chunk","chunk":{"key":c.key,"path":c.path,"start_line":1,"end_line":1},"content":c.content}})).collect();
     let groups: Vec<_> = points[..40].iter().map(|p| json!({"id":p["payload"]["chunk"]["path"],"hits":[p]})).collect();
-    let results = [json!([{"id":"manifest", "payload":{"kind":"manifest","snapshot":"snapshot"}}]),
+    let results = [json!([{"id":"manifest", "payload":{"kind":"manifest","snapshot":"snapshot","revision":rev}}]),
         json!({"groups":groups}), json!({"points":&points[15..]})];
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}",listener.local_addr().unwrap());
@@ -83,11 +83,38 @@ async fn review_ranks_all_verified_candidates_in_batches_and_ignores_chat_top_n(
         qdrant:&qdrant, verifier:&verifier, ignore:Some(&ignore)};
     let changed = [ChangedFile {kind:"modified".into(),path:"src/module0.ts".into(),base_path:String::new(),
         edits:vec![],unknown:false,hunk_text:String::new(),excerpt:"function chargeCard(user) {}".into()}];
-    let out = pipeline.enrich(&rev,"Review changes",&changed).unwrap();
+    let out = pipeline.enrich_current(&rev,"Review changes",&changed).unwrap();
     server.join().unwrap();
     assert_eq!(*rank.calls.borrow(),vec![50,2]);
     assert_eq!(out.len(),52);
     assert!(out[..3].iter().any(|r| r.path=="src/caller.ts"));
     assert!(out[..3].iter().any(|r| r.path=="tests/payment.test.ts"));
     assert!(serde_json::to_vec(&out).unwrap().len()<=config.content_bytes);
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+async fn strict_retrieval_rejects_missing_and_stale_manifests_before_embedding() {
+    for result in [json!([]),json!([{"payload":{"kind":"manifest","snapshot":"old",
+        "revision":{"tenant_id":"t","provider":"github","provider_instance":"github.com","repository_id":"1","revision_id":"old"}}}])] {
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint=format!("http://{}",listener.local_addr().unwrap());
+        let server=std::thread::spawn(move || {
+            let (mut stream,_)=listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes=Vec::new();let mut buffer=[0;4096];
+            let end=loop {let n=stream.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);
+                if let Some(i)=bytes.windows(4).position(|w|w==b"\r\n\r\n"){break i+4;}};
+            let header=String::from_utf8(bytes[..end].to_vec()).unwrap();
+            let length=header.lines().find_map(|l|l.to_lowercase().strip_prefix("content-length:").map(|s|s.trim().parse::<usize>().unwrap())).unwrap();
+            while bytes.len()<end+length{let n=stream.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);}
+            let response=json!({"status":"ok","result":result}).to_string();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}",response.len(),response).unwrap();
+        });
+        let qdrant=Qdrant{endpoint,api_key:None,client:reqwest::Client::new()};
+        let rank=Rank{calls:RefCell::new(Vec::new())};let verifier=Verify{chunks:vec![]};let config=RetrievalConfig::default();
+        let pipeline=Pipeline{config:&config,schema:Schema::cohere(1024),embedder:&Embed,reranker:&rank,qdrant:&qdrant,verifier:&verifier,ignore:None};
+        let rev=SourceRevision{tenant_id:"t".into(),provider:"github".into(),provider_instance:"github.com".into(),repository_id:"1".into(),revision_id:"current".into()};
+        assert!(pipeline.enrich_current(&rev,"Review changes",&[]).is_err());
+        assert!(rank.calls.borrow().is_empty());server.join().unwrap();
+    }
 }

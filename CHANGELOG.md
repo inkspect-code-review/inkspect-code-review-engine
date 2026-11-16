@@ -11,6 +11,15 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-15
+
+#### Added
+
+- Optional strict indexed review mode that refreshes stale revisions and fails on
+  retrieval errors, plus an operator limit on index embedding input bytes.
+- Durable review scope, index revision and selected context location receipts,
+  with atomic progress while indexing during review. No source bodies in receipts.
+
 ### 2026-11-12
 
 #### Added
