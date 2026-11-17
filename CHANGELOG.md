@@ -11,6 +11,12 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-17
+
+#### Added
+
+- Accept an explicit, bounded file-path scope for independent candidate verification while preserving containment, content checks, and default repair restrictions.
+
 ### 2026-11-15
 
 #### Added

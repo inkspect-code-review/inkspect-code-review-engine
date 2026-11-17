@@ -19,6 +19,25 @@ pub(crate) fn safe_path(path: &str) -> bool {
         && indexer::eligible(path)
 }
 
+// The caller owns user authorization. This optional verifier-only scope never
+// relaxes path containment and leaves normal repair generation unchanged.
+fn approval_path(path: &str) -> bool {
+    !path.is_empty() && path.len() <= 512 && !path.contains(['\\', ':']) && !path.chars().any(char::is_control)
+        && path.split('/').all(|s| !s.is_empty() && s != "." && s != ".."
+            && ![".git", "node_modules", "dist", "target", "vendor"].contains(&s.to_ascii_lowercase().as_str()))
+}
+
+fn approved_paths(request: &Value) -> Result<BTreeSet<String>> {
+    let Some(value) = request.get("approved_paths") else { return Ok(BTreeSet::new()); };
+    let paths = value.as_array().filter(|p| p.len() <= 40).ok_or_else(|| err(Code::QueueInvalid, "invalid approved paths"))?;
+    let mut result = BTreeSet::new();
+    for path in paths {
+        let path = path.as_str().filter(|p| approval_path(p)).ok_or_else(|| err(Code::QueueInvalid, "invalid approved path"))?;
+        if !result.insert(path.to_owned()) { return Err(err(Code::QueueInvalid, "duplicate approved path")); }
+    }
+    Ok(result)
+}
+
 fn apply(repair: Repair, files: &BTreeMap<String, String>, ids: &BTreeSet<String>) -> Result<Value> {
     let received: BTreeSet<_> = repair.finding_ids.iter().cloned().collect();
     if &received != ids || received.len() != repair.finding_ids.len() || repair.edits.len() > 80 {
@@ -99,6 +118,8 @@ pub async fn run(host: &HostConfig, job: &ReviewJob, request: Value) -> Result<V
 // against the pinned GitHub commit; no candidate program executes in this process.
 pub async fn verify_candidate(host: &HostConfig, job: &ReviewJob, request: Value) -> Result<Value> {
     job.validate()?;
+    let approved = approved_paths(&request)?;
+    let allowed = |path: &str| safe_path(path) || (approval_path(path) && approved.contains(path));
     let report: Report = serde_json::from_value(request["report"].clone()).map_err(|_| err(Code::QueueInvalid,"invalid source report"))?;
     let attempt=request["attempt"].as_u64().filter(|n| (1..=3).contains(n)).ok_or_else(||err(Code::QueueInvalid,"invalid attempt"))? as usize;
     if report.run.target != job.target_revision() || report.findings.is_empty() || report.findings.len()>40 { return Err(err(Code::QueueInvalid,"review scope mismatch")); }
@@ -111,13 +132,13 @@ pub async fn verify_candidate(host: &HostConfig, job: &ReviewJob, request: Value
         let path=f["path"].as_str().ok_or_else(||err(Code::Source,"invalid candidate path"))?;
         let content=f["content"].as_str().ok_or_else(||err(Code::Source,"invalid candidate content"))?;
         bytes+=content.len();
-        if !safe_path(path) || policy.as_ref().is_some_and(|p|p.excluded(path)) || !paths.insert(path.to_owned()) || content.len()>256000 || bytes>512000 || content.contains('\0') || indexer::contains_secret(content) {return Err(err(Code::Source,"unsafe candidate"));}
+        if !allowed(path) || policy.as_ref().is_some_and(|p|p.excluded(path)) || !paths.insert(path.to_owned()) || content.len()>256000 || bytes>512000 || content.contains('\0') || indexer::contains_secret(content) {return Err(err(Code::Source,"unsafe candidate"));}
         proposed.insert(path.to_owned(),content.to_owned());
     }
-    for f in &report.findings {if f.revision!=job.target_revision() || !safe_path(&f.location.path) {return Err(err(Code::Source,"invalid finding"));}ids.insert(f.id.clone());paths.insert(f.location.path.clone());}
+    for f in &report.findings {if f.revision!=job.target_revision() || !allowed(&f.location.path) {return Err(err(Code::Source,"invalid finding"));}ids.insert(f.id.clone());paths.insert(f.location.path.clone());}
     for path in paths {
         let entry=git::index_git(clone.path(), &["--literal-pathspecs","ls-tree","-z",&job.head_sha,"--",&path],&token).await?;
-        if !entry.is_empty() && !entry.starts_with(b"100644 blob ") {return Err(err(Code::Source,"unsupported candidate file mode"));}
+        if !entry.is_empty() && !entry.starts_with(b"100644 blob ") && !entry.starts_with(b"100755 blob ") {return Err(err(Code::Source,"unsupported candidate file mode"));}
         if let Some(content)=indexer::read_blob(clone.path(),&job.head_sha,&path,&token).await? {original.insert(path.clone(),content.clone());proposed.entry(path).or_insert(content);}
     }
     if report.findings.iter().any(|f| !original.contains_key(&f.location.path)) {return Err(err(Code::Source,"finding source unavailable"));}
@@ -239,6 +260,20 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     fn repair(before: &str, after: &str) -> Repair { Repair { finding_ids: vec!["f1".into()], edits: vec![Edit { path:"src/math.ts".into(), before:before.into(), after:after.into() }], unable_reason:None } }
+    #[test]
+    fn explicit_verifier_scope_keeps_containment_and_default_generation_rules() {
+        let value = json!({"approved_paths":[".github/workflows/test.yml","Dockerfile","config.toml"]});
+        let paths = approved_paths(&value).unwrap();
+        assert!(paths.contains(".github/workflows/test.yml"));
+        assert!(!safe_path(".github/workflows/test.yml"));
+        assert!(safe_path("package.json"));
+        for path in ["../x", "/x", ".git/config", "a/../x", "a\\b", "node_modules/x", "dist/x"] {
+            assert!(approved_paths(&json!({"approved_paths":[path]})).is_err(), "{path}");
+        }
+        assert!(approved_paths(&json!({"approved_paths":["a.yml","a.yml"]})).is_err());
+        assert!(approved_paths(&json!({"approved_paths":"*"})).is_err());
+        assert!(approved_paths(&json!({})).unwrap().is_empty());
+    }
     #[test]
     fn exact_repairs_only() {
         let files = BTreeMap::from([("src/math.ts".into(), "while (d * d < n) {}".into())]);
