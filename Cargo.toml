@@ -34,4 +34,4 @@ aws-sdk-bedrockruntime = "1.70"
 aws-smithy-types = "1.2"
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 rsa = { version = "0.9", features = ["sha2"] }
-rand = "0.8"
+rand = "0.10"
