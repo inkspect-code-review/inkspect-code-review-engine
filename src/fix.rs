@@ -2,6 +2,8 @@
 //! program, hook, test command or model-provided command is executed here.
 //! The API alone owns GitHub write credentials and atomic publication.
 use crate::{config::{HostConfig, ReviewJob}, domain::Report, error::{err, Code, Result}, git, model::ReviewModel, retrieval::indexer, sandbox};
+#[path = "fix_context.rs"]
+mod context;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,7 +134,7 @@ pub async fn verify_candidate(host: &HostConfig, job: &ReviewJob, request: Value
         let path=f["path"].as_str().ok_or_else(||err(Code::Source,"invalid candidate path"))?;
         let content=f["content"].as_str().ok_or_else(||err(Code::Source,"invalid candidate content"))?;
         bytes+=content.len();
-        if !allowed(path) || policy.as_ref().is_some_and(|p|p.excluded(path)) || !paths.insert(path.to_owned()) || content.len()>256000 || bytes>512000 || content.contains('\0') || indexer::contains_secret(content) {return Err(err(Code::Source,"unsafe candidate"));}
+        if !allowed(path) || policy.as_ref().is_some_and(|p|p.excluded(path)) || !paths.insert(path.to_owned()) || content.len()>524288 || bytes>1048576 || content.contains('\0') || indexer::contains_secret(content) {return Err(err(Code::Source,"unsafe candidate"));}
         proposed.insert(path.to_owned(),content.to_owned());
     }
     for f in &report.findings {if f.revision!=job.target_revision() || !allowed(&f.location.path) {return Err(err(Code::Source,"invalid finding"));}ids.insert(f.id.clone());paths.insert(f.location.path.clone());}
@@ -143,7 +145,19 @@ pub async fn verify_candidate(host: &HostConfig, job: &ReviewJob, request: Value
     }
     if report.findings.iter().any(|f| !original.contains_key(&f.location.path)) {return Err(err(Code::Source,"finding source unavailable"));}
     let nonce=crate::prompts::new_nonce();let system=format!("{}\nThe executed_checks_and_gaps field describes pipeline checks and explicitly unavailable tools or tests. A skipped check is not a passed check. If source inspection cannot establish closure without an unavailable check, return uncertain. Do not reject solely because a repository uses another language or lacks a build script.",crate::fix_verification::system(&nonce));
-    let user=format!("{nonce}\n{}\n{nonce}",json!({"findings":report.findings,"original_files":original,"proposed_files":proposed,"executed_checks_and_gaps":request["checks"],"changed_paths":files.iter().map(|f|&f["path"]).collect::<Vec<_>>()}));
+    // Supporting large files use exact numbered excerpts. Finding files remain
+    // complete. Omitted spans are proven identical locally, never model claims.
+    let mut supporting_changes=BTreeMap::new();
+    for path in proposed.keys().cloned().collect::<Vec<_>>() {
+        if proposed[&path].len()>32000 && !report.findings.iter().any(|f|f.location.path==path) {
+            if let Some(before)=original.get(&path) {
+                supporting_changes.insert(path.clone(),context::excerpts(before,&proposed[&path]));
+                original.remove(&path);proposed.remove(&path);
+            }
+        }
+    }
+    let system=format!("{system} Large supporting files may be supplied in supporting_file_changes as exact numbered original/proposed spans. Only byte-identical lines are omitted. Inspect every changed span and use the supplied proposed_start_line for evidence. If omitted context is needed to establish closure, return uncertain.");
+    let user=format!("{nonce}\n{}\n{nonce}",json!({"findings":report.findings,"original_files":original,"proposed_files":proposed,"supporting_file_changes":supporting_changes,"executed_checks_and_gaps":request["checks"],"changed_paths":files.iter().map(|f|&f["path"]).collect::<Vec<_>>()}));
     if !request_fits(host,&system,&user) {return Err(err(Code::FixVerification,"verification context exceeds operation budget"));}
     let digest=crate::fix_verification::candidate_hash(&job.run_id,&job.head_sha,&report.run.id,files)?;
     crate::telemetry::record(json!({"kind":"fix.verification.started","attempt":attempt,"candidate_sha256":digest}))?;
@@ -334,7 +348,7 @@ mod tests {
     }
     fn verdict(status: &str) -> String {
         json!({"findings":[{"id":"F1","status":status,"reason":"An intermediate symlink still redirects the write.",
-            "evidence":[{"path":"src/a.ts","start_line":1,"end_line":1}]}],"regressions":[]}).to_string()
+            "evidence":[{"path":"src/a.ts","start_line":1,"end_line":1}],"follow_up":{"status":status,"reason":"The subsequent filesystem write is checked against the same destination boundary.","evidence":[{"path":"src/a.ts","start_line":1,"end_line":1}]}}],"regressions":[]}).to_string()
     }
     async fn scripted(host: HostConfig, responses: Vec<Result<String>>) -> (Result<Value>, Vec<(bool,usize,String,String)>) {
         let job: ReviewJob=serde_json::from_str(include_str!("../examples/job.example.json")).unwrap();
@@ -370,6 +384,19 @@ mod tests {
             assert!(payload.get("fix_prompt").is_none());
             assert_eq!(payload["findings"][0]["id"],"F1");
         }
+    }
+    #[tokio::test]
+    async fn a_follow_up_bypass_refines_the_repair_even_when_initial_trigger_is_resolved() {
+        let mut partial:Value=serde_json::from_str(&verdict("resolved")).unwrap();
+        partial["findings"][0]["follow_up"]["status"]=json!("unresolved");
+        partial["findings"][0]["follow_up"]["reason"]=json!("The subsequent write still uses the old path.");
+        let (result,calls)=scripted(loop_host(),vec![Ok(edit("src/a.ts","a","b")),Ok(partial.to_string()),
+            Ok(edit("src/a.ts","b","c")),Ok(verdict("resolved"))]).await;
+        let result=result.unwrap();assert_eq!(result["verification"]["attempts"],2);
+        assert_eq!(result["files"][0]["content"],"c");
+        let payload:Value=serde_json::from_str(calls[2].3.lines().nth(1).unwrap()).unwrap();
+        let finding=&payload["verification_feedback"][0]["verdict"]["findings"][0];
+        assert_eq!(finding["status"],"resolved");assert_eq!(finding["follow_up"]["status"],"unresolved");
     }
     #[tokio::test]
     async fn three_rejections_stop_after_six_calls_without_publishable_output() {
