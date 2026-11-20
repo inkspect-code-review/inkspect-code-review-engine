@@ -13,6 +13,12 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ### 2026-11-17
 
+#### Fixed
+
+- Require a separate, evidenced assessment of subsequent state transitions before accepting a repair, so initial-trigger closure alone cannot authorize publication.
+
+- Verify larger repair candidates with exact numbered change context for supporting files; unchanged spans are checked locally and candidate receipts still bind every byte.
+
 #### Added
 
 - Accept an explicit, bounded file-path scope for independent candidate verification while preserving containment, content checks, and default repair restrictions.
