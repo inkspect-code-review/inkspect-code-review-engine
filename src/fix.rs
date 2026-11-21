@@ -310,7 +310,7 @@ mod tests {
     fn saved_prompt_is_reused_exactly_and_legacy_reports_render_without_review() {
         use crate::domain::*;
         let mut report = Report {
-            presentation: None, schema_version:"1".into(),
+            presentation: None, resolved_findings: Vec::new(), schema_version:"1".into(),
             run:ReviewRun { id:"source".into(),status:"completed".into(),freshness:"current".into(),
                 coverage_complete:true,target:SourceRevision::default(),base:SourceRevision::default(),
                 model:ModelSelection{provider:"bedrock".into(),model_id:"model".into()},exclusions:None,review_notes:vec![] },

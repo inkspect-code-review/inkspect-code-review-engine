@@ -37,6 +37,13 @@ pub struct HostConfig {
     pub output_nano_usd: u64,
     #[serde(default)]
     pub budget_nano_usd: u64,
+    /// For PR reviews, fit changed files to this request size and record the
+    /// estimated cost without enforcing the monetary budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_effort_review_bytes: Option<usize>,
+    /// Plan PR review requests against the selected model and combine all parts.
+    #[serde(default)]
+    pub token_planned_review: bool,
     /// Require a current index and successful retrieval; never silently fall back.
     #[serde(default)]
     pub require_indexed_context: bool,
@@ -150,6 +157,8 @@ pub struct ReviewJob {
     /// Optional high-level instructions the review should focus on. Untrusted.
     #[serde(default)]
     pub review_notes: Vec<ReviewNote>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_findings: Vec<PriorFinding>,
     /// When true, the engine posts inline comments on the PR (the capability
     /// the Go engine lacks). When false it only returns the report.
     #[serde(default)]
@@ -159,6 +168,15 @@ pub struct ReviewJob {
     /// When false, a missing index just means the review runs without RAG.
     #[serde(default)]
     pub auto_review: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorFinding {
+    pub thread: String,
+    pub path: String,
+    pub title: String,
+    pub reason: String,
+    pub suggestion: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +218,11 @@ impl ReviewJob {
         }
         if !valid_sha(&self.base_sha) || !valid_sha(&self.head_sha) {
             return Err(err(Code::QueueInvalid, "invalid commit sha"));
+        }
+        if self.prior_findings.len() > 20 || self.prior_findings.iter().any(|f|
+            f.thread.is_empty() || f.thread.len() > 20 || !f.thread.bytes().all(|b| b.is_ascii_digit())
+            || f.path.len() > 1024 || f.title.len() + f.reason.len() + f.suggestion.len() > 4096) {
+            return Err(err(Code::QueueInvalid, "invalid prior findings"));
         }
         if self.review_notes.len() > 5 {
             return Err(err(Code::QueueInvalid, "too many review notes"));

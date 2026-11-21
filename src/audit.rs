@@ -5,9 +5,11 @@ use std::path::Path;
 use crate::config::ReviewJob;
 use crate::error::{err, Code, Result};
 
-pub fn capture(job: &ReviewJob, model: &str, region: &str, max_tokens: i32, system: &str, user: &str) -> Result<()> {
+pub fn capture(part: usize, job: &ReviewJob, model: &str, region: &str, max_tokens: i32, system: &str, user: &str) -> Result<()> {
     let Some(path) = std::env::var_os("INKSPECT_REVIEW_CONTEXT_FILE") else { return Ok(()); };
-    write_private(Path::new(&path), &document(job, model, region, max_tokens, system, user))
+    let mut path = std::path::PathBuf::from(path);
+    if part > 1 { path.set_file_name(format!("review-part-{part}-context.json")); }
+    write_private(&path, &document(job, model, region, max_tokens, system, user))
 }
 
 pub fn capture_fix_call(job: &ReviewJob, model: &str, region: &str, max_tokens: i32, system: &str, user: &str, attempt: usize, verification: bool) -> Result<()> {
@@ -92,7 +94,7 @@ mod tests {
         let system = crate::prompts::system_prompt(&nonce);
         let rag = vec![crate::retrieval::Retrieved { path: "math.ts".into(), start_line: 3, end_line: 4, content: "// GİT\nexport const n = 42;".into() }];
         let notes = serde_json::to_value(&job.review_notes).unwrap();
-        let user = crate::prompts::user_message(&nonce, "Add math", "PR intent", &crate::git::DiffSummary { files: vec![] }, &[], &rag, &notes);
+        let user = crate::prompts::user_message(&nonce, "Add math", "PR intent", &[], &[], &rag, &notes, &[]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model-context.json");
         write_private(&path, &document(&job, "model-id", "eu-west-2", 2048, &system, &user)).unwrap();

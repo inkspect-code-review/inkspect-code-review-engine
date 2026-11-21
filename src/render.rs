@@ -44,7 +44,7 @@ pub fn attach(report: &mut Report) {
 
 pub fn finding_comment(f: &Finding) -> String {
     let login = app_login(&std::env::var("INKSPECT_GITHUB_APP_SLUG").unwrap_or_default());
-    format!("**{} · {}**\n\n{}\n\n**Suggested fix**\n{}\n\n**Verification**\n{}\n\nComment `@{login} review again` after pushing your changes to request another review.",
+    format!("**{} · {}**\n\n{}\n\n**Suggested fix**\n{}\n\n**Verification**\n{}\n\nNew pushes trigger an automatic review when enabled. To request another pass on the same commit, comment `@{login} review again`.",
         severity_label(f.severity), md(&sanitize_text(&f.title, 500)), md(&sanitize_text(&f.reason, 3000)),
         md(&sanitize_text(&f.suggestion, 3000)), md(&sanitize_text(&f.verification, 3000)))
 }
@@ -301,7 +301,7 @@ mod tests {
 
     fn sample_report() -> Report {
         Report {
-            presentation: None,
+            presentation: None, resolved_findings: Vec::new(),
             schema_version: "1".into(),
             run: ReviewRun {
                 id: "J-1".into(),

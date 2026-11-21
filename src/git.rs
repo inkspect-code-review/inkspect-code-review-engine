@@ -57,12 +57,12 @@ const MAX_DIFF_FILES: usize = 500;
 /// Hooks, submodules and non-https protocols stay disabled. Indexing only ever
 /// reads immutable objects of the pinned commit.
 pub(crate) async fn index_git(repo_dir: &Path, args: &[&str], token: &str) -> Result<Vec<u8>> {
-    index_git_args(repo_dir, args, token).await
+    index_git_args(repo_dir, args, token, None).await
 }
 
 /// `index_git` for arguments that need not be UTF-8, such as repository paths
 /// passed as pathspecs.
-async fn index_git_args<S>(repo_dir: &Path, args: &[S], token: &str) -> Result<Vec<u8>>
+async fn index_git_args<S>(repo_dir: &Path, args: &[S], token: &str, remaining: Option<u64>) -> Result<Vec<u8>>
 where
     S: AsRef<OsStr> + std::fmt::Debug,
 {
@@ -104,6 +104,20 @@ where
             .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {auth}"));
     }
 
+    if let Some(limit) = remaining {
+        use tokio::io::AsyncReadExt;
+        use std::process::Stdio;
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+            .map_err(|_| err(Code::Source, "git invocation failed"))?;
+        let mut raw=Vec::new();
+        child.stdout.take().ok_or_else(|| err(Code::Source, "missing diff stream"))?
+            .take(limit.saturating_add(1)).read_to_end(&mut raw).await
+            .map_err(|_| err(Code::Source, "diff read failed"))?;
+        if raw.len() as u64 > limit { return Err(err(Code::Source, "diff exceeds worker memory allowance")); }
+        if !child.wait().await.is_ok_and(|status| status.success()) {return Err(err(Code::Source,"git command returned an error"));}
+        return Ok(raw);
+    }
+
     let out = cmd
         .output()
         .await
@@ -119,8 +133,8 @@ where
 /// Compute the diff between base and head. Both commits/trees are present in
 /// the partial clone; the changed-file blobs are lazy-fetched from the promisor
 /// remote via `index_git` (token-scoped https), since the clone omits blobs.
-pub async fn diff(repo_dir: &Path, base_sha: &str, head_sha: &str, token: &str) -> Result<DiffSummary> {
-    let raw = index_git(
+async fn read_diff(repo_dir: &Path, base_sha: &str, head_sha: &str, token: &str, remaining: Option<u64>) -> Result<DiffSummary> {
+    let raw = index_git_args(
         repo_dir,
         &[
             "diff",
@@ -131,11 +145,11 @@ pub async fn diff(repo_dir: &Path, base_sha: &str, head_sha: &str, token: &str) 
             base_sha,
             head_sha,
         ],
-        token,
+        token, remaining,
     )
     .await?;
     let text = String::from_utf8_lossy(&raw);
-    parse_unified_diff(&text)
+    parse_unified_diff(&text, remaining.is_some())
 }
 
 /// Upper bound on pathspec bytes passed to git, far below the OS argv limit.
@@ -157,13 +171,19 @@ pub async fn diff_with_policy(
     token: &str,
     policy: Option<&IgnorePolicy>,
 ) -> Result<(DiffSummary, usize)> {
+    scoped_diff(repo_dir, base_sha, head_sha, token, policy, None).await
+}
+
+pub async fn scoped_diff(repo_dir: &Path, base_sha: &str, head_sha: &str, token: &str,
+    policy: Option<&IgnorePolicy>, mut remaining: Option<u64>) -> Result<(DiffSummary, usize)> {
+    let complete=remaining.is_some();
     let Some(policy) = policy else {
-        return Ok((diff(repo_dir, base_sha, head_sha, token).await?, 0));
+        return Ok((read_diff(repo_dir, base_sha, head_sha, token, remaining).await?, 0));
     };
-    let names = index_git(
+    let names = index_git_args(
         repo_dir,
         &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", base_sha, head_sha],
-        token,
+        token, remaining,
     )
     .await?;
     let mut kept: Vec<&[u8]> = Vec::new();
@@ -176,7 +196,7 @@ pub async fn diff_with_policy(
         }
     }
     if excluded == 0 {
-        return Ok((diff(repo_dir, base_sha, head_sha, token).await?, 0));
+        return Ok((read_diff(repo_dir, base_sha, head_sha, token, remaining).await?, 0));
     }
     // Never run the content diff without a pathspec here: that would diff
     // everything, excluded files included.
@@ -197,17 +217,24 @@ pub async fn diff_with_policy(
     .iter()
     .map(OsString::from)
     .collect();
+    let fixed = args.len();
     let mut bytes = 0;
-    for path in kept.iter().take(MAX_DIFF_FILES) {
-        bytes += path.len() + 1;
-        if bytes > MAX_PATHSPEC_BYTES {
-            tracing::warn!("review scope truncated at the pathspec size limit");
-            break;
+    let mut files = Vec::new();
+    for path in kept.iter().take(if complete { usize::MAX } else { MAX_DIFF_FILES }) {
+        if bytes + path.len() + 1 > MAX_PATHSPEC_BYTES {
+            if !complete { break; }
+            let raw = index_git_args(repo_dir, &args, token, remaining).await?;
+            remaining=remaining.map(|n|n.saturating_sub(raw.len() as u64));
+            files.extend(parse_unified_diff(&String::from_utf8_lossy(&raw), true)?.files);
+            args.truncate(fixed);
+            bytes = 0;
         }
+        bytes += path.len() + 1;
         args.push(os_path(path));
     }
-    let raw = index_git_args(repo_dir, &args, token).await?;
-    Ok((parse_unified_diff(&String::from_utf8_lossy(&raw))?, excluded))
+    let raw = index_git_args(repo_dir, &args, token, remaining).await?;
+    files.extend(parse_unified_diff(&String::from_utf8_lossy(&raw), complete)?.files);
+    Ok((DiffSummary { files }, excluded))
 }
 
 /// A repository path as git reported it, byte for byte.
@@ -224,25 +251,12 @@ fn os_path(path: &[u8]) -> OsString {
 
 /// Parse a unified diff into structured changed files. Binary files and
 /// oversized hunks are marked `unknown` with an empty excerpt.
-fn parse_unified_diff(text: &str) -> Result<DiffSummary> {
+fn parse_unified_diff(text: &str, complete: bool) -> Result<DiffSummary> {
     let mut files: Vec<ChangedFile> = Vec::new();
     let mut current: Option<ChangedFile> = None;
     let mut hunk_buf = String::new();
 
-    let flush = |current: &mut Option<ChangedFile>, hunk_buf: &mut String| {
-        if let Some(mut f) = current.take() {
-            f.hunk_text = std::mem::take(hunk_buf);
-            if f.hunk_text.len() > MAX_FILE_HUNK_BYTES {
-                f.hunk_text.truncate(cut_boundary(&f.hunk_text, MAX_FILE_HUNK_BYTES));
-                f.unknown = true;
-            }
-            f.excerpt = build_excerpt(&f.hunk_text);
-            f
-        } else {
-            return;
-        };
-    };
-
+    let file_limit = if complete { usize::MAX } else { MAX_DIFF_FILES };
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             // Finalize the previous file.
@@ -250,7 +264,7 @@ fn parse_unified_diff(text: &str) -> Result<DiffSummary> {
                 f.hunk_text = std::mem::take(&mut hunk_buf);
                 f.excerpt = build_excerpt(&f.hunk_text);
                 files.push(f);
-                if files.len() >= MAX_DIFF_FILES {
+                if files.len() >= file_limit {
                     break;
                 }
             }
@@ -283,28 +297,28 @@ fn parse_unified_diff(text: &str) -> Result<DiffSummary> {
             if let Some(edit) = parse_hunk_header(h) {
                 f.edits.push(edit);
             }
-            push_bounded(&mut hunk_buf, line);
+            push_diff_line(&mut hunk_buf, line, complete);
         } else if line.starts_with("+++") || line.starts_with("---") {
             // header lines; keep in hunk text for readability but not required
-            push_bounded(&mut hunk_buf, line);
+            push_diff_line(&mut hunk_buf, line, complete);
         } else if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ') {
-            push_bounded(&mut hunk_buf, line);
+            push_diff_line(&mut hunk_buf, line, complete);
         }
     }
     // Finalize the last file.
     if let Some(mut f) = current.take() {
         f.hunk_text = hunk_buf;
-        if f.hunk_text.len() > MAX_FILE_HUNK_BYTES {
+        if !complete && f.hunk_text.len() > MAX_FILE_HUNK_BYTES {
             let n = cut_boundary(&f.hunk_text, MAX_FILE_HUNK_BYTES);
             f.hunk_text.truncate(n);
             f.unknown = true;
         }
         f.excerpt = build_excerpt(&f.hunk_text);
-        if files.len() < MAX_DIFF_FILES {
+        if files.len() < file_limit {
             files.push(f);
         }
     }
-    let _ = flush; // silence unused in case of future refactor
+
 
     Ok(DiffSummary { files })
 }
@@ -321,7 +335,7 @@ fn parse_git_header_paths(rest: &str) -> (String, String) {
 }
 
 /// Parse `@@ -a,b +c,d @@` into a LineEdit. Counts default to 1 when omitted.
-fn parse_hunk_header(h: &str) -> Option<LineEdit> {
+pub(crate) fn parse_hunk_header(h: &str) -> Option<LineEdit> {
     let end = h.find("@@")?;
     let spec = &h[..end];
     let mut parts = spec.split_whitespace();
@@ -344,8 +358,8 @@ fn parse_range(s: &str) -> (u32, u32) {
     (start, lines)
 }
 
-fn push_bounded(buf: &mut String, line: &str) {
-    if buf.len() + line.len() + 1 <= MAX_FILE_HUNK_BYTES {
+fn push_diff_line(buf: &mut String, line: &str, complete: bool) {
+    if complete || buf.len() + line.len() + 1 <= MAX_FILE_HUNK_BYTES {
         buf.push_str(line);
         buf.push('\n');
     }

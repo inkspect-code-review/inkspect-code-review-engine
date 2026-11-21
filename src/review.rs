@@ -47,6 +47,46 @@ fn on_changed_line(diff: &DiffSummary, path: &str, start: u32, end: u32) -> bool
     false
 }
 
+// Count the target lines actually sent to the model. A capped hunk can
+// still have an edit range in the metadata even though its source was cut.
+fn visible_addition(hunks: &str, line: u32) -> bool {
+    let mut current = None;
+    let mut remaining = 0;
+    let mut found = false;
+    for text in hunks.lines() {
+        if let Some(header) = text.strip_prefix("@@ ") {
+            if remaining == 0 && found { return true; }
+            let Some(edit) = crate::git::parse_hunk_header(header) else { return false };
+            current = Some(edit.target_start);
+            remaining = edit.target_lines;
+            found = false;
+        } else if let Some(number) = current {
+            if text.starts_with('+') || text.starts_with(' ') {
+                if remaining == 0 { return false; }
+                found |= number == line && text.starts_with('+');
+                remaining -= 1;
+                current = number.checked_add(1);
+            }
+        }
+    }
+    remaining == 0 && found
+}
+
+/// Only admit unique assessments of supplied findings with visible target-side evidence.
+pub fn verified_resolutions(
+    prior: &[crate::config::PriorFinding], diff: &DiffSummary, raw: &RawReview,
+) -> Vec<crate::domain::FindingResolution> {
+    if raw.resolved_findings.len() > prior.len() { return Vec::new(); }
+    raw.resolved_findings.iter().filter(|r| {
+        let Some(source) = prior.iter().find(|p| p.thread == r.thread) else { return false };
+        !r.explanation.trim().is_empty() && r.explanation.len() <= 800 && r.line > 0
+            && raw.resolved_findings.iter().filter(|other| other.thread == r.thread).count() == 1
+            && diff.files.iter().any(|f| !f.unknown && f.path == source.path)
+            && diff.files.iter().any(|f| !f.unknown && f.path == r.path && visible_addition(&f.hunk_text, r.line))
+            && !raw.findings.iter().any(|f| f.path == r.path && f.start_line <= r.line && r.line <= f.end_line)
+    }).cloned().collect()
+}
+
 /// Build the final report from the single model response.
 pub fn build_report(
     run_id: &str,
@@ -133,7 +173,7 @@ pub fn build_report(
     });
 
     Report {
-        presentation: None,
+        presentation: None, resolved_findings: Vec::new(),
         schema_version: "1".into(),
         run: ReviewRun {
             id: run_id.to_string(),
@@ -181,7 +221,7 @@ pub fn excluded_report(
     exclusions: ReviewExclusions,
 ) -> Report {
     let report = Report {
-        presentation: None,
+        presentation: None, resolved_findings: Vec::new(),
         schema_version: "1".into(),
         run: ReviewRun {
             id: run_id.to_string(),
@@ -435,5 +475,36 @@ mod tests {
         let b = finding_id(&rev(), &loc, "t", "r");
         assert_eq!(a, b);
         assert!(a.starts_with("F-"));
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use crate::config::PriorFinding;
+    use crate::git::{ChangedFile, DiffSummary};
+    use serde_json::json;
+
+    #[test]
+    fn resolution_needs_a_known_finding_and_visible_added_source() {
+        let diff = DiffSummary { files: vec![ChangedFile {
+            path: "code.rs".into(), base_path: "code.rs".into(), kind: "modified".into(), unknown: false,
+            edits: vec![], hunk_text: "@@ -5,2 +5,2 @@\n context\n-old\n+corrected\n".into(), excerpt: String::new(),
+        }] };
+        let prior = vec![PriorFinding { thread: "12".into(), path: "code.rs".into(), title: "Issue".into(),
+            reason: "Reason".into(), suggestion: "Suggestion".into() }];
+        let resolution = json!({"thread":"12","path":"code.rs","line":6,"explanation":"Checks the target before admitting the request."});
+        let review = |items| serde_json::from_value(json!({"summary":"Reviewed","decision":"ready","findings":[],"resolved_findings":items})).unwrap();
+        let raw = review(json!([resolution]));
+        assert_eq!(verified_resolutions(&prior, &diff, &raw).len(), 1);
+        assert!(verified_resolutions(&[], &diff, &raw).is_empty());
+        for (key, value) in [("thread",json!("13")), ("path",json!("foreign.rs")), ("line",json!(5)), ("line",json!(7)), ("explanation",json!(" "))] {
+            let mut wrong = resolution.clone();
+            wrong[key] = value;
+            assert!(verified_resolutions(&prior, &diff, &review(json!([wrong]))).is_empty());
+        }
+        assert!(verified_resolutions(&prior, &diff, &review(json!([resolution,resolution]))).is_empty());
+        assert!(!visible_addition("@@ -1 +1,3 @@\n+incomplete\n", 1));
+        assert!(!visible_addition("@@ -1 +1 @@\n-removed\n", 1));
     }
 }

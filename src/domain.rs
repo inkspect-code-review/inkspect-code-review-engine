@@ -231,6 +231,16 @@ pub struct ChangeAlignment {
     pub rationale: String,
 }
 
+/// A prior discussion explicitly verified against a changed line at the new head.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindingResolution {
+    pub thread: String,
+    pub path: String,
+    pub line: u32,
+    pub explanation: String,
+}
+
 /// The persisted and published review report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -245,6 +255,8 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scores: Option<Scores>,
     pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_findings: Vec<FindingResolution>,
     pub verification_gaps: Vec<VerificationGap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagram: Option<Diagram>,

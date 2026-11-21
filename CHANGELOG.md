@@ -11,6 +11,18 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-21
+
+#### Added
+
+- Timestamp engine receipts and record revision checks, checkout preparation and report assembly.
+
+### 2026-11-20
+
+#### Added
+
+- Reassess supplied prior findings during PR review and return a specific explanation and changed source line for each verified repair.
+
 ### 2026-11-17
 
 #### Fixed

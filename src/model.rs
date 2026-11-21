@@ -1,8 +1,7 @@
-//! The single review model call (Bedrock Converse) and strict response parsing.
+//! Review model transport, input counting and strict response parsing.
 //!
-//! Unlike the Go engine, which makes one call per obligation plus separate
-//! judge and diagram calls, this makes ONE Converse call: system prompt +
-//! one untrusted user payload in, one JSON object (findings + diagram) out.
+//! Each inference receives a system prompt and a bounded untrusted payload,
+//! and returns a JSON object with findings and presentation data.
 //!
 //! The system message carries all instructions; the user message carries all
 //! untrusted data wrapped in a per-call nonce (see `crate::prompts`). The
@@ -116,6 +115,8 @@ pub struct RawReview {
     pub scores: Option<RawScores>,
     pub findings: Vec<RawFinding>,
     #[serde(default)]
+    pub resolved_findings: Vec<crate::domain::FindingResolution>,
+    #[serde(default)]
     pub diagram: Option<RawDiagram>,
 }
 
@@ -126,13 +127,14 @@ pub struct ReviewModel {
     region: String,
     max_output_tokens: i32,
     max_response_bytes: usize,
+    review_calls: std::cell::Cell<usize>,
 }
 
 impl ReviewModel {
     pub async fn new(region: &str, model_id: &str, max_output_tokens: i32) -> Result<ReviewModel> {
         if let Some(provider) = crate::byok::Provider::from_pipe()? {
             return Ok(ReviewModel { client:None, model_id:provider.model.clone(), region:provider.provider.clone(),
-                max_output_tokens:max_output_tokens.min(provider.max_output_tokens), max_response_bytes:256*1024, byok:Some(provider) });
+                review_calls: 0.into(), max_output_tokens:max_output_tokens.min(provider.max_output_tokens), max_response_bytes:256*1024, byok:Some(provider) });
         }
         let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()))
@@ -142,6 +144,7 @@ impl ReviewModel {
             .await;
         Ok(ReviewModel {
             client: Some(Client::new(&cfg)),
+            review_calls: 0.into(),
             byok: None,
             model_id: model_id.to_string(),
             region: region.to_string(),
@@ -150,10 +153,54 @@ impl ReviewModel {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_client(client: Client) -> Self {
+        Self { client:Some(client),byok:None,model_id:"global.openai.gpt-6.1-sol".into(),
+            region:"us-east-1".into(),max_output_tokens:4096,max_response_bytes:256*1024,review_calls:0.into() }
+    }
+
     pub fn provider(&self) -> &str { self.byok.as_ref().map(|p| p.provider.as_str()).unwrap_or("bedrock") }
     pub fn model_id(&self) -> &str { &self.model_id }
 
-    /// Make the single Converse call and return the parsed review.
+    /// A deployment may expose a model alias without publishing its window. In
+    /// that case the provider validates the whole request before inference.
+    pub async fn input_limit(&self) -> Result<Option<usize>> {
+        let id = self.model_id.split("openai.").last().unwrap_or(&self.model_id);
+        let (window, max_input): (usize, usize) = match id {
+            "gpt-5.4-mini" => (400_000, 272_000),
+            "gpt-5.4" | "gpt-5.5" => (1_050_000, 1_050_000),
+            "gpt-6-sol" | "gpt-6-astra" | "gpt-6-luna"
+            | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6.2-sol" => (1_050_000, 922_000),
+            _ => {
+                if let Some(provider) = &self.byok {
+                    return provider.input_limit(self.max_output_tokens).await.map(Some);
+                }
+                return Ok(None);
+            }
+        };
+        Ok(Some(window.saturating_sub(self.max_output_tokens as usize).min(max_input)))
+    }
+
+    pub async fn count_input(&self, system: &str, user: &str) -> Result<Option<usize>> {
+        if let Some(provider) = &self.byok { return provider.count_input(system, user).await.map(Some); }
+        let message = Message::builder().role(ConversationRole::User)
+            .content(ContentBlock::Text(user.into())).build().map_err(|_| err(Code::Model,"invalid count request"))?;
+        let input = aws_sdk_bedrockruntime::types::ConverseTokensRequest::builder()
+            .system(SystemContentBlock::Text(system.into())).messages(message).build();
+        let result = self.client.as_ref().ok_or_else(|| err(Code::Model,"missing token counter"))?
+            .count_tokens().model_id(&self.model_id)
+            .input(aws_sdk_bedrockruntime::types::CountTokensInput::Converse(input)).send().await;
+        match result {
+            Ok(out) if out.input_tokens() > 0 => Ok(Some(out.input_tokens() as usize)),
+            // Some inference profiles support Converse but have no CountTokens
+            // endpoint. The inference endpoint can still validate the exact input.
+            Err(e) if matches!(e.raw_response().map(|r| r.status().as_u16()), Some(400 | 403 | 404 | 501)) => Ok(None),
+            Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16()==413) => Ok(Some(usize::MAX)),
+            _ => Err(err(Code::Model, "model token count unavailable")),
+        }
+    }
+
+    /// Make a Converse call and return the parsed review.
     pub async fn review(&self, system: &str, user: &str, job: &crate::config::ReviewJob) -> Result<RawReview> {
         parse_review(&self.complete(system, user, job).await?)
     }
@@ -170,7 +217,7 @@ impl ReviewModel {
 
     async fn complete_captured(&self, system: &str, user: &str, job: &crate::config::ReviewJob, attempt: Option<usize>, verification: bool) -> Result<String> {
         if let Some(attempt) = attempt { crate::audit::capture_fix_call(job, &self.model_id, &self.region, self.max_output_tokens, system, user, attempt, verification)?; }
-        else { crate::audit::capture(job, &self.model_id, &self.region, self.max_output_tokens, system, user)?; }
+        else { let part = self.review_calls.get() + 1; self.review_calls.set(part); crate::audit::capture(part, job, &self.model_id, &self.region, self.max_output_tokens, system, user)?; }
         let receipt = crate::telemetry::next_id();
         crate::telemetry::record(serde_json::json!({"kind":"model.started", "id":receipt, "attempt":attempt, "phase":if verification {"fix_verification"} else {"generation"}}))?;
         if let Some(provider) = &self.byok { return provider.complete(system,user,self.max_output_tokens,receipt).await; }
@@ -202,6 +249,13 @@ impl ReviewModel {
                     "outcome":"request_failed", "http_status":e.raw_response().map(|r| r.status().as_u16()),
                     "provider_error_code":e.as_service_error().and_then(|s|s.code())
                 }));
+                let service = e.as_service_error();
+                let status = e.raw_response().map(|r| r.status().as_u16());
+                if status == Some(413) || (status == Some(400)
+                    && service.and_then(|s| s.code()) == Some("ValidationException")
+                    && service.and_then(|s|s.message()).is_some_and(is_context_rejection)) {
+                    return context_rejection(receipt);
+                }
                 err(Code::Model, "converse call failed")
             })?;
 
@@ -239,6 +293,19 @@ impl ReviewModel {
 
         Ok(text)
     }
+}
+
+pub(crate) const CONTEXT_LIMIT: &str = "model rejected input length before inference";
+pub(crate) fn is_context_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["input is too long", "input too long", "too many input tokens", "input length exceeds",
+     "maximum context length", "context length exceeded", "prompt is too long",
+     "input token count exceeds", "exceeds the model context", "input is too large",
+     "input is longer than", "too many tokens in the input"].iter().any(|s| lower.contains(s))
+}
+pub(crate) fn context_rejection(receipt: usize) -> crate::error::EngineError {
+    if let Err(e) = crate::telemetry::record(serde_json::json!({"kind":"model.input_rejected","id":receipt})) { return e; }
+    err(Code::Model, CONTEXT_LIMIT)
 }
 
 /// Strictly decode the single JSON object. Tolerates a single ```json fence
