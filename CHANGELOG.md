@@ -13,6 +13,11 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ### 2026-11-21
 
+#### Fixed
+
+- Allow reviews with an unlisted OpenAI model to split the input when the provider reports a context limit.
+- Retain verification gaps and incomplete coverage across review batches, giving blocking findings precedence in the combined decision.
+
 #### Added
 
 - Timestamp engine receipts and record revision checks, checkout preparation and report assembly.

@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::ReviewJob;
-use crate::domain::{Decision, Report, Severity, SourceRevision, VerificationGap};
+use crate::domain::{Decision, Report, SourceRevision, VerificationGap};
 use crate::error::{err, Code, Result};
 use crate::git::{ChangedFile, DiffSummary};
 use crate::model::{ReviewModel, CONTEXT_LIMIT};
@@ -469,6 +469,12 @@ fn combine(mut parts: Vec<Report>) -> Result<Report> {
             "no reviewable change fits the model context window",
         ));
     }
+    let needs_changes = parts
+        .iter()
+        .any(|part| part.decision == Decision::NeedsChanges);
+    let needs_evidence = parts
+        .iter()
+        .any(|part| part.decision == Decision::NeedsEvidence);
     let mut report = parts.remove(0);
     if parts.is_empty() {
         return Ok(report);
@@ -489,6 +495,8 @@ fn combine(mut parts: Vec<Report>) -> Result<Report> {
             }
             _ => None,
         };
+        report.run.coverage_complete &= part.run.coverage_complete;
+        report.verification_gaps.extend(part.verification_gaps);
         report.findings.extend(part.findings);
         report.resolved_findings.extend(part.resolved_findings);
         report.presentation_notes.extend(part.presentation_notes);
@@ -510,8 +518,13 @@ fn combine(mut parts: Vec<Report>) -> Result<Report> {
                     && r.line <= f.location.end_line
             })
     });
-    report.decision = if report.findings.iter().any(|f| f.severity != Severity::Low) {
+    report.decision = if needs_changes {
         Decision::NeedsChanges
+    } else if needs_evidence
+        || !report.run.coverage_complete
+        || report.verification_gaps.iter().any(|gap| gap.blocking)
+    {
+        Decision::NeedsEvidence
     } else {
         Decision::ReadyForReview
     };
@@ -553,6 +566,27 @@ mod tests {
         }
     }
 
+    fn read_request(stream: &std::net::TcpStream) -> (String, Value) {
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let mut size = 0;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(length) = header.to_lowercase().strip_prefix("content-length:") {
+                size = length.trim().parse().unwrap();
+            }
+        }
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        (request, body)
+    }
+
     // Exercise the actual CountTokens and Converse wire formats through a local
     // SDK endpoint. Only the synthetic counter decides whether batching is needed.
     async fn exercise(split: bool, fail_second: bool, native_validation: bool) {
@@ -563,23 +597,7 @@ mod tests {
             let mut reviewed = Vec::new();
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
-                let mut reader = BufReader::new(&stream);
-                let mut request = String::new();
-                reader.read_line(&mut request).unwrap();
-                let mut size = 0;
-                loop {
-                    let mut header = String::new();
-                    reader.read_line(&mut header).unwrap();
-                    if header == "\r\n" {
-                        break;
-                    }
-                    if let Some(length) = header.to_lowercase().strip_prefix("content-length:") {
-                        size = length.trim().parse().unwrap();
-                    }
-                }
-                let mut bytes = vec![0; size];
-                reader.read_exact(&mut bytes).unwrap();
-                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let (request, body) = read_request(&stream);
                 let counting = request.contains("/count-tokens ");
                 let conv = if counting {
                     &body["input"]["converse"]
@@ -686,6 +704,109 @@ mod tests {
     #[tokio::test]
     async fn unsupported_counter_uses_definitive_provider_validation() {
         exercise(true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_openai_model_splits_only_after_a_context_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut provider = crate::byok::Provider::decode(
+            &serde_json::to_vec(&json!({
+                "provider": "openai", "model": "deployment-alias",
+                "api_key": "x".repeat(16), "max_output_tokens": 4096
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        provider.test_port = Some(port);
+        let model = ReviewModel::from_provider(provider, 4096);
+        let server = std::thread::spawn(move || {
+            let mut batches = Vec::new();
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.unwrap();
+                let (request, body) = read_request(&stream);
+                assert!(request.starts_with("POST /v1/responses "));
+                assert_eq!(body["model"], "deployment-alias");
+                let input: Value =
+                    serde_json::from_str(body["input"].as_str().unwrap().lines().nth(1).unwrap())
+                        .unwrap();
+                let paths: Vec<_> = input["untrusted_changed_source"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|file| file["path"].as_str().unwrap().to_owned())
+                    .collect();
+                let (status, response) = if paths.len() > 1 {
+                    (
+                        "400 Bad Request",
+                        json!({"error":{"code":"context_length_exceeded"}}),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        json!({"status":"completed","output":[{"type":"message","role":"assistant",
+                        "content":[{"type":"output_text","text":r#"{"summary":"Reviewed","decision":"ready","findings":[]}"#}]}]}),
+                    )
+                };
+                batches.push(paths);
+                let data = response.to_string();
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len()).unwrap();
+            }
+            batches
+        });
+        let job: ReviewJob =
+            serde_json::from_str(include_str!("../examples/job.example.json")).unwrap();
+        let target = job.target_revision();
+        let diff = DiffSummary {
+            files: vec![file("a.rs", "alpha"), file("b.rs", "beta")],
+        };
+        let report = run(&model, &job, "Change", "", &diff, &[], &target, &target)
+            .await
+            .unwrap();
+        assert_eq!(report.decision, Decision::ReadyForReview);
+        assert!(report.run.coverage_complete);
+        assert_eq!(
+            server.join().unwrap(),
+            [vec!["a.rs", "b.rs"], vec!["a.rs"], vec!["b.rs"]]
+        );
+    }
+
+    #[test]
+    fn combining_reports_preserves_blocking_gaps_and_verdict_precedence_in_both_orders() {
+        let job: ReviewJob =
+            serde_json::from_str(include_str!("../examples/job.example.json")).unwrap();
+        let target = job.target_revision();
+        let scope = DiffSummary {
+            files: vec![file("a.rs", "alpha")],
+        };
+        let raw = crate::model::parse_review(
+            r#"{"summary":"Reviewed","decision":"ready","findings":[]}"#,
+        )
+        .unwrap();
+        let ready =
+            review::build_report(&job.run_id, &target, &target, "test", "test", &scope, raw);
+        let mut incomplete = ready.clone();
+        mark_gap(&mut incomplete, "Missing source".into());
+        for decision in [Decision::ReadyForReview, Decision::NeedsChanges] {
+            let mut other = ready.clone();
+            other.decision = decision;
+            for parts in [
+                vec![incomplete.clone(), other.clone()],
+                vec![other.clone(), incomplete.clone()],
+            ] {
+                let combined = combine(parts).unwrap();
+                let expected = if decision == Decision::NeedsChanges {
+                    decision
+                } else {
+                    Decision::NeedsEvidence
+                };
+                assert_eq!(combined.decision, expected);
+                assert!(!combined.run.coverage_complete);
+                assert_eq!(combined.verification_gaps.len(), 1);
+                assert!(combined.verification_gaps[0].blocking);
+                assert_eq!(combined.verification_gaps[0].reason, "Missing source");
+            }
+        }
     }
 
     #[test]

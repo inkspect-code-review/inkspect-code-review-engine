@@ -133,8 +133,7 @@ pub struct ReviewModel {
 impl ReviewModel {
     pub async fn new(region: &str, model_id: &str, max_output_tokens: i32) -> Result<ReviewModel> {
         if let Some(provider) = crate::byok::Provider::from_pipe()? {
-            return Ok(ReviewModel { client:None, model_id:provider.model.clone(), region:provider.provider.clone(),
-                review_calls: 0.into(), max_output_tokens:max_output_tokens.min(provider.max_output_tokens), max_response_bytes:256*1024, byok:Some(provider) });
+            return Ok(Self::from_provider(provider, max_output_tokens));
         }
         let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()))
@@ -151,6 +150,18 @@ impl ReviewModel {
             max_output_tokens,
             max_response_bytes: 256 * 1024,
         })
+    }
+
+    pub(crate) fn from_provider(provider: crate::byok::Provider, max_output_tokens: i32) -> Self {
+        Self {
+            client: None,
+            model_id: provider.model.clone(),
+            region: provider.provider.clone(),
+            review_calls: 0.into(),
+            max_output_tokens: max_output_tokens.min(provider.max_output_tokens),
+            max_response_bytes: 256 * 1024,
+            byok: Some(provider),
+        }
     }
 
     #[cfg(test)]
@@ -173,7 +184,7 @@ impl ReviewModel {
             | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6.2-sol" => (1_050_000, 922_000),
             _ => {
                 if let Some(provider) = &self.byok {
-                    return provider.input_limit(self.max_output_tokens).await.map(Some);
+                    return provider.input_limit(self.max_output_tokens).await;
                 }
                 return Ok(None);
             }

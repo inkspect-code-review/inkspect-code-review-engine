@@ -11,6 +11,9 @@ pub struct Provider {
     pub provider: String,
     pub model: String,
     api_key: String,
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) test_port: Option<u16>,
     pub max_output_tokens: i32,
 }
 impl Provider {
@@ -51,8 +54,9 @@ impl Provider {
         }
     }
 
-    pub async fn input_limit(&self, output: i32) -> Result<usize> {
+    pub async fn input_limit(&self, output: i32) -> Result<Option<usize>> {
         let (url, field) = match self.provider.as_str() {
+            "openai" => return Ok(None),
             "anthropic" => (format!("https://api.anthropic.com/v1/models/{}", self.model), "max_input_tokens"),
             "google" => (format!("https://generativelanguage.googleapis.com/v1beta/models/{}", self.model), "inputTokenLimit"),
             _ => return Err(err(Code::Model,"unknown model context window")),
@@ -62,7 +66,7 @@ impl Provider {
             .ok_or_else(|| err(Code::Model,"missing model context window"))?;
         let available = if self.provider == "anthropic" { limit.saturating_sub(output as usize) } else { limit };
         if available == 0 { return Err(err(Code::Model,"invalid model context window")); }
-        Ok(available)
+        Ok(Some(available))
     }
 
     async fn metadata(&self, request: reqwest::RequestBuilder) -> Result<Value> {
@@ -98,6 +102,11 @@ impl Provider {
     pub async fn complete(&self, system: &str, user: &str, max: i32, receipt: usize) -> Result<String> {
         let (host, body) = self.payload(system,user,max);
         let url = if self.provider=="google" {format!("{host}/v1beta/models/{}:generateContent",self.model)} else {host.into()};
+        #[cfg(test)]
+        let url = match self.test_port {
+            Some(port) => format!("http://127.0.0.1:{port}/v1/responses"),
+            None => url,
+        };
         let client=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never())
             .timeout(std::time::Duration::from_secs(180)).build().map_err(|_|err(Code::Model,"provider client unavailable"))?;
         let (header, secret) = match self.provider.as_str() {"openai"=>("authorization",format!("Bearer {}",self.api_key)),"anthropic"=>("x-api-key",self.api_key.clone()),_=>("x-goog-api-key",self.api_key.clone())};
@@ -212,7 +221,7 @@ mod tests {
     }
     #[test] fn request_envelopes_keep_instructions_outside_untrusted_input() {
         for provider in ["openai","anthropic","google"] {
-            let p=Provider{provider:provider.into(),model:"test-model".into(),api_key:"secret".into(),max_output_tokens:1024};
+            let p=Provider{provider:provider.into(),model:"test-model".into(),api_key:"secret".into(),test_port:None,max_output_tokens:1024};
             let (url,v)=p.payload("trusted","untrusted",1024);
             assert!(url.starts_with("https://")); assert!(!v.to_string().contains("secret"));
             if provider=="openai" {assert_eq!(v["store"],false);assert_eq!(v["instructions"],"trusted");}
