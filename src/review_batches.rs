@@ -1,7 +1,7 @@
 //! Token-aware review of a pinned PR. One result is published after all parts succeed.
 use std::collections::{HashMap, HashSet};
 
-use crate::config::ReviewJob;
+use crate::config::{HostConfig, ReviewJob};
 use crate::domain::{Decision, Report, SourceRevision, VerificationGap};
 use crate::error::{err, Code, Result};
 use crate::git::{ChangedFile, DiffSummary};
@@ -168,9 +168,56 @@ impl Prompt<'_> {
     }
 }
 
+struct RequestLimits<'a> {
+    window: Option<usize>,
+    budget: Option<&'a HostConfig>,
+    remaining: u128,
+}
+
+impl<'a> RequestLimits<'a> {
+    fn new(window: Option<usize>, host: &'a HostConfig) -> Self {
+        let enforce = host.budget_nano_usd > 0 && host.best_effort_review_bytes.is_none();
+        Self {
+            window,
+            budget: enforce.then_some(host),
+            remaining: host.budget_nano_usd.into(),
+        }
+    }
+
+    // None means shrink the input before requesting inference. A budget error
+    // terminates the operation before it can authorize another paid call.
+    fn reservation(&self, tokens: Option<usize>, bytes: usize) -> Result<Option<u128>> {
+        if tokens
+            .zip(self.window)
+            .is_some_and(|(used, max)| used > max)
+        {
+            return Ok(None);
+        }
+        let Some(host) = self.budget else {
+            return Ok(Some(0));
+        };
+        if host.model_input_allowance == 0 || host.model_max_output_tokens <= 0 {
+            return Err(err(Code::Model, "invalid review budget allowance"));
+        }
+        // When token counting is unsupported, conservatively bound text input
+        // by the UTF-8 request bytes plus the message envelope allowance.
+        let input = tokens.unwrap_or(bytes) as u128;
+        if bytes > host.model_max_request_bytes || input > u128::from(host.model_input_allowance) {
+            return Ok(None);
+        }
+        let cost = input * u128::from(host.input_nano_usd)
+            + host.model_max_output_tokens as u128 * u128::from(host.output_nano_usd);
+        if cost > self.remaining {
+            return Err(err(Code::Model, "review inference budget exceeded"));
+        }
+        Ok(Some(cost))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     model: &ReviewModel,
+    host: &HostConfig,
     job: &ReviewJob,
     title: &str,
     body: &str,
@@ -196,42 +243,59 @@ pub async fn run(
         .sum::<usize>()
         .max(1);
     crate::telemetry::record(json!({"kind":"review.plan","parts_limit":maximum}))?;
-    let limit = model.input_limit().await?;
-    let mut report = if let Some(raw) =
-        attempt(model, &prompt, &system, &diff.files, retrieved, None, limit).await?
+    let mut limits = RequestLimits::new(model.input_limit().await?, host);
+    let mut report = if let Some(raw) = attempt(
+        model,
+        &prompt,
+        &system,
+        &diff.files,
+        retrieved,
+        None,
+        &mut limits,
+    )
+    .await?
     {
         verified_report(model, job, target, base, diff, raw)
     } else {
         let order = Links::new(&diff.files).order();
         let units: Vec<_> = order
             .into_iter()
-            .flat_map(|i| fragments(&diff.files[i]))
+            .flat_map(|i| fragments(&diff.files[i], 32 * 1024))
             .collect();
         let links = Links::new(&units);
         let mut pending = Vec::new();
         let mut reports = Vec::new();
         if units.len() > 1 {
             let mid = split_point(&units);
-            pending.extend([(mid, units.len()), (0, mid)]);
+            pending.extend([(mid, units.len(), None), (0, mid, None)]);
         } else {
-            pending.push((0, units.len()));
+            pending.push((0, units.len(), None));
         }
         let mut omitted = Vec::new();
         let mut missing_links = 0;
-        while let Some((start, end)) = pending.pop() {
-            let files = &units[start..end];
+        while let Some((start, end, piece)) = pending.pop() {
+            let files = piece
+                .as_ref()
+                .map(std::slice::from_ref)
+                .unwrap_or(&units[start..end]);
             let related = links.context(start, end);
-            if let Some(raw) = attempt(
+            let mut raw = attempt(
                 model,
                 &prompt,
                 &system,
                 files,
                 retrieved,
                 Some(&related),
-                limit,
+                &mut limits,
             )
-            .await?
-            {
+            .await?;
+            if raw.is_none() && files.len() == 1 {
+                raw = attempt(model, &prompt, &system, files, &[], None, &mut limits).await?;
+                if raw.is_some() && units.len() > 1 {
+                    missing_links += 1;
+                }
+            }
+            if let Some(raw) = raw {
                 reports.push(verified_report(
                     model,
                     job,
@@ -244,24 +308,22 @@ pub async fn run(
                 ));
             } else if files.len() > 1 {
                 let mid = start + split_point(files);
-                pending.extend([(mid, end), (start, mid)]);
-            } else {
-                // Try just this fragment when even the compact PR map is too large.
-                if let Some(raw) = attempt(model, &prompt, &system, files, &[], None, limit).await?
-                {
-                    missing_links += 1;
-                    reports.push(verified_report(
-                        model,
-                        job,
-                        target,
-                        base,
-                        &DiffSummary {
-                            files: files.to_vec(),
-                        },
-                        raw,
-                    ));
+                pending.extend([(mid, end, None), (start, mid, None)]);
+            } else if let [file] = files {
+                // A long hunk header must not prevent even two short source
+                // lines from being split after a provider rejection.
+                let body_bytes = file
+                    .hunk_text
+                    .lines()
+                    .skip_while(|line| !line.starts_with("@@ "))
+                    .filter(|line| !line.starts_with("@@ "))
+                    .map(|line| line.len() + 1)
+                    .sum::<usize>();
+                let parts = fragments(file, body_bytes / 2);
+                if parts.len() > 1 {
+                    pending.extend(parts.into_iter().rev().map(|p| (start, end, Some(p))));
                 } else {
-                    omitted.extend(files.iter().map(|f| f.path.clone()));
+                    omitted.push(file.path.clone());
                 }
             }
         }
@@ -348,21 +410,20 @@ async fn attempt(
     files: &[ChangedFile],
     mut retrieved: &[Retrieved],
     related: Option<&Value>,
-    limit: Option<usize>,
+    limits: &mut RequestLimits<'_>,
 ) -> Result<Option<crate::model::RawReview>> {
     loop {
         let user = prompt.message(files, retrieved, related);
-        let fits = match limit {
-            Some(max) => model
-                .count_input(system, &user)
-                .await?
-                .is_none_or(|n| n <= max),
-            None => true,
+        let tokens = if limits.window.is_some() || limits.budget.is_some() {
+            model.count_input(system, &user).await?
+        } else {
+            None
         };
-        if fits {
+        if let Some(cost) = limits.reservation(tokens, system.len() + user.len() + 4096)? {
+            limits.remaining -= cost;
             match model.review(system, &user, prompt.job).await {
                 Ok(raw) => return Ok(Some(raw)),
-                Err(e) if e.reason == CONTEXT_LIMIT => {}
+                Err(e) if e.reason == CONTEXT_LIMIT => limits.remaining += cost,
                 Err(e) => return Err(e),
             }
         }
@@ -375,9 +436,8 @@ async fn attempt(
 
 // Partition very large text diffs on line boundaries, preserving both base and
 // head coordinates in synthetic unified hunk headers. Never cut a UTF-8 line.
-fn fragments(file: &ChangedFile) -> Vec<ChangedFile> {
-    const PIECE: usize = 32 * 1024;
-    if file.hunk_text.len() <= PIECE {
+fn fragments(file: &ChangedFile, piece_bytes: usize) -> Vec<ChangedFile> {
+    if file.hunk_text.len() <= piece_bytes {
         return vec![file.clone()];
     }
     let mut parts = Vec::new();
@@ -424,7 +484,7 @@ fn fragments(file: &ChangedFile) -> Vec<ChangedFile> {
         if !active {
             continue;
         }
-        if !block.is_empty() && block.len() + line.len() + 1 > PIECE {
+        if !block.is_empty() && block.len() + line.len() + 1 > piece_bytes {
             flush(&mut parts, &mut block, base, head, removed, added);
             base += removed;
             head += added;
@@ -549,6 +609,10 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
+    fn host() -> HostConfig {
+        serde_json::from_str(include_str!("../examples/host.example.json")).unwrap()
+    }
+
     fn file(path: &str, code: &str) -> ChangedFile {
         ChangedFile {
             path: path.into(),
@@ -670,7 +734,18 @@ mod tests {
         let target = job.target_revision();
         let mut base = target.clone();
         base.revision_id = job.base_sha.clone();
-        let result = run(&model, &job, "Change", "", &diff, &[], &target, &base).await;
+        let result = run(
+            &model,
+            &host(),
+            &job,
+            "Change",
+            "",
+            &diff,
+            &[],
+            &target,
+            &base,
+        )
+        .await;
         if fail_second {
             assert!(result.is_err());
         } else {
@@ -686,6 +761,109 @@ mod tests {
                 .map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    // The synthetic token counter accepts at most one line. Record every
+    // inference request (not count requests) to check coverage and spending.
+    async fn run_small_hunk(budget: u64) -> (Result<Report>, Vec<u32>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for connection in listener.incoming() {
+                let mut stream = connection.unwrap();
+                let mut first = [0; 1];
+                if stream.peek(&mut first).unwrap() == 0 {
+                    break;
+                }
+                let (request, body) = read_request(&stream);
+                let counting = request.contains("/count-tokens ");
+                let conversation = if counting {
+                    &body["input"]["converse"]
+                } else {
+                    &body
+                };
+                let prompt = conversation["messages"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap();
+                let payload: Value = serde_json::from_str(prompt.lines().nth(1).unwrap()).unwrap();
+                let hunk = payload["untrusted_changed_source"][0]["hunk"]
+                    .as_str()
+                    .unwrap();
+                let edit = crate::git::parse_hunk_header(
+                    hunk.lines().next().unwrap().trim_start_matches("@@ "),
+                )
+                .unwrap();
+                let response = if counting {
+                    json!({"inputTokens":if edit.target_lines > 1 {923_000} else {1000}})
+                } else {
+                    assert_eq!(edit.target_lines, 1);
+                    seen.push(edit.target_start);
+                    assert_eq!(hunk.lines().nth(1), Some(format!("+line{}", edit.target_start).as_str()));
+                    json!({"output":{"message":{"role":"assistant","content":[{"text":r#"{"summary":"Reviewed","decision":"ready","findings":[]}"#}]}},
+                        "stopReason":"end_turn","usage":{"inputTokens":1000,"outputTokens":10,"totalTokens":1010},"metrics":{"latencyMs":1}})
+                }.to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+            }
+            seen
+        });
+        let config = Config::builder()
+            .behavior_version_latest()
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("fixture", "fixture", None, None, "test"))
+            .retry_config(aws_config::retry::RetryConfig::disabled())
+            .endpoint_url(format!("http://{address}"))
+            .build();
+        let model = ReviewModel::with_test_client(Client::from_conf(config));
+        let mut host = host();
+        host.model_max_output_tokens = 4096;
+        host.model_input_allowance = 922_000;
+        host.model_max_request_bytes = 256 * 1024;
+        host.input_nano_usd = 1;
+        host.output_nano_usd = 1;
+        host.budget_nano_usd = budget;
+        let job: ReviewJob =
+            serde_json::from_str(include_str!("../examples/job.example.json")).unwrap();
+        let target = job.target_revision();
+        let mut file = file("sample.rs", "");
+        file.hunk_text = "@@ -7,0 +8,4 @@ change\n+line8\n+line9\n+line10\n+line11\n".into();
+        file.edits = vec![crate::git::parse_hunk_header("-7,0 +8,4 @@").unwrap()];
+        let diff = DiffSummary { files: vec![file] };
+        let result = run(
+            &model,
+            &host,
+            &job,
+            "Change",
+            "",
+            &diff,
+            &[],
+            &target,
+            &target,
+        )
+        .await;
+        // Closing an empty connection terminates the fixture even on a budget rejection.
+        drop(std::net::TcpStream::connect(address).unwrap());
+        (result, server.join().unwrap())
+    }
+
+    #[tokio::test]
+    async fn small_rejected_fragment_is_subdivided_until_every_line_fits() {
+        let (result, seen) = run_small_hunk(4 * 5096).await;
+        let report = result.unwrap();
+        assert_eq!(seen, [8, 9, 10, 11]);
+        assert!(report.run.coverage_complete && report.verification_gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insufficient_operation_budget_prevents_unauthorized_inference() {
+        for (budget, expected) in [(5095, vec![]), (2 * 5096 - 1, vec![8])] {
+            let (result, seen) = run_small_hunk(budget).await;
+            assert_eq!(
+                result.unwrap_err().reason,
+                "review inference budget exceeded"
+            );
+            assert_eq!(seen, expected);
+        }
     }
 
     #[tokio::test]
@@ -760,9 +938,19 @@ mod tests {
         let diff = DiffSummary {
             files: vec![file("a.rs", "alpha"), file("b.rs", "beta")],
         };
-        let report = run(&model, &job, "Change", "", &diff, &[], &target, &target)
-            .await
-            .unwrap();
+        let report = run(
+            &model,
+            &host(),
+            &job,
+            "Change",
+            "",
+            &diff,
+            &[],
+            &target,
+            &target,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.decision, Decision::ReadyForReview);
         assert!(report.run.coverage_complete);
         assert_eq!(
@@ -854,7 +1042,7 @@ mod tests {
         let mut f = file("big.rs", "");
         let text = "let key = \"ş\";".repeat(3000);
         f.hunk_text = format!("@@ -20,1 +20,3 @@\n-old\n+a\n+{text}\n+z\n");
-        let parts = fragments(&f);
+        let parts = fragments(&f, 32 * 1024);
         assert_eq!(parts.len(), 3);
         assert_eq!(
             parts

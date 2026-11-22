@@ -17,6 +17,11 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 - Offer GitHub's native commit suggestion for concrete fixes that match the selected lines of a pull request.
 
+#### Fixed
+
+- Split a rejected review fragment down to individual diff lines before skipping it, preserving source coordinates.
+- Enforce the configured inference budget across all token-planned review requests.
+
 ### 2026-11-21
 
 #### Fixed

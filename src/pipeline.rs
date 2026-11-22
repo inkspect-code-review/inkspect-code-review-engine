@@ -178,7 +178,7 @@ pub async fn run(
         crate::telemetry::record(serde_json::json!({"kind":"review.context","revision":job.head_sha,
             "sources": retrieved.iter().map(|r| serde_json::json!({"path":r.path,"start_line":r.start_line,"end_line":r.end_line})).collect::<Vec<_>>() }))?;
         let model = ReviewModel::new(&host.model_region, &host.model_id, host.model_max_output_tokens).await?;
-        let report = crate::review_batches::run(&model, job, &snapshot.title, &snapshot.body, &diff, &retrieved, &target, &base).await?;
+        let report = crate::review_batches::run(&model, host, job, &snapshot.title, &snapshot.body, &diff, &retrieved, &target, &base).await?;
         let mut report = review::with_exclusions(report, exclusions);
         report.run.review_notes = job.review_notes.clone();
         crate::render::attach(&mut report);
