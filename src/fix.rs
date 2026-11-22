@@ -317,7 +317,7 @@ mod tests {
             summary:"Review".into(),decision:Decision::ReadyForReview,change_alignment:None,scores:None,
             findings:vec![Finding{id:"F1".into(),title:"Contain writes".into(),severity:Severity::Medium,
                 reason:"Links escape the directory".into(),suggestion:"Prevent link traversal".into(),verification:"Test links".into(),
-                advisory:None,revision:SourceRevision::default(),location:Location{path:"src/a.ts".into(),start_line:1,end_line:1},evidence_ids:vec![]}],
+                advisory:None,replacement_lines:None,revision:SourceRevision::default(),location:Location{path:"src/a.ts".into(),start_line:1,end_line:1},evidence_ids:vec![]}],
             verification_gaps:vec![],diagram:None,presentation_notes:vec![],
         };
         assert_eq!(source_fix_prompt(&mut report).unwrap(),

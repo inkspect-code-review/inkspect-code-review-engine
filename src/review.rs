@@ -87,6 +87,21 @@ pub fn verified_resolutions(
     }).cloned().collect()
 }
 
+fn verified_replacement(
+    fix: crate::model::RawCodeFix, location: &Location, diff: &DiffSummary,
+) -> Option<Vec<String>> {
+    if fix.original == fix.replacement
+        || fix.replacement.iter().map(|line| line.len() + 1).sum::<usize>() > 58_000
+        || fix.replacement.iter().any(|line| line.chars().any(|c| c.is_control() && c != '\t'))
+    {
+        return None;
+    }
+    let matches_source = diff.files.iter().filter(|f| f.path == location.path && !f.unknown)
+        .any(|f| crate::git::selected_lines(&f.hunk_text, location.start_line, location.end_line)
+            .is_some_and(|lines| lines == fix.original));
+    matches_source.then_some(fix.replacement)
+}
+
 /// Build the final report from the single model response.
 pub fn build_report(
     run_id: &str,
@@ -119,6 +134,7 @@ pub fn build_report(
             severity: rf.severity,
             reason: rf.reason,
             suggestion: rf.suggestion,
+            replacement_lines: rf.code_fix.and_then(|fix| verified_replacement(fix, &loc, diff)),
             verification: rf.verification,
             revision: target.clone(),
             location: loc,

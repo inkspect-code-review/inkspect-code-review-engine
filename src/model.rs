@@ -33,6 +33,21 @@ pub struct RawFinding {
     pub reason: String,
     pub suggestion: String,
     pub verification: String,
+    #[serde(default, deserialize_with = "optional_code_fix")]
+    pub code_fix: Option<RawCodeFix>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCodeFix {
+    pub original: Vec<String>,
+    pub replacement: Vec<String>,
+}
+
+// A malformed optional edit must not discard an otherwise valid finding.
+fn optional_code_fix<'de, D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Option<RawCodeFix>, D::Error> {
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[derive(Debug, Deserialize)]

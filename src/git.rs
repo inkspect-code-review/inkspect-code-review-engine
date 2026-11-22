@@ -323,6 +323,39 @@ fn parse_unified_diff(text: &str, complete: bool) -> Result<DiffSummary> {
     Ok(DiffSummary { files })
 }
 
+/// Read an inclusive target-side selection from one complete unified diff hunk.
+/// A capped hunk may have lost intermediate lines, so check its counts before
+/// trusting the coordinates, even if the selection itself appears present.
+pub(crate) fn selected_lines(patch: &str, start: u32, end: u32) -> Option<Vec<&str>> {
+    if start == 0 || end < start {
+        return None;
+    }
+    let mut lines = patch.lines().peekable();
+    while let Some(header) = lines.next() {
+        let Some(edit) = header.strip_prefix("@@ ").and_then(parse_hunk_header) else { continue };
+        let target_end = u64::from(edit.target_start) + u64::from(edit.target_lines);
+        if start < edit.target_start || u64::from(end) >= target_end {
+            continue;
+        }
+        let mut target = u64::from(edit.target_start);
+        let mut base_count = 0u64;
+        let mut selected = Vec::new();
+        while let Some(line) = lines.next_if(|line| !line.starts_with("@@ ")) {
+            if line.starts_with(['-', ' ']) {
+                base_count += 1;
+            }
+            if let Some(text) = line.strip_prefix(['+', ' ']) {
+                if (u64::from(start)..=u64::from(end)).contains(&target) {
+                    selected.push(text);
+                }
+                target += 1;
+            }
+        }
+        return (target == target_end && base_count == u64::from(edit.base_lines)).then_some(selected);
+    }
+    None
+}
+
 /// Parse the `a/path b/path` portion of a `diff --git` header.
 fn parse_git_header_paths(rest: &str) -> (String, String) {
     // Format: a/old b/new (quoting aside). Best-effort split on " b/".

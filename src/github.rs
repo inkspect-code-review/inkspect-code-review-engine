@@ -11,6 +11,7 @@
 //! logged.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 
 use crate::config::ReviewJob;
 use crate::domain::Finding;
@@ -142,29 +143,10 @@ impl GitHub {
             .as_ref()
             .ok_or_else(|| err(Code::Publish, "no write token configured"))?;
 
-        // Determine which lines are commentable (right side of the diff).
-        let patch_lines = self.pr_patch_right_lines(job).await?;
-
-        let mut comments = Vec::new();
-        for f in findings {
-            let line = f.location.end_line;
-            let key = (f.location.path.clone(), line);
-            if !patch_lines.contains(&key) {
-                continue; // not on a changed right-side line; skip inline
-            }
-            comments.push(serde_json::json!({
-                "path": f.location.path,
-                "line": line,
-                "side": "RIGHT",
-                // Dedup marker keeps re-reviews from duplicating comments.
-                "body": format!(
-                    "<!-- inkspect:{}:{} -->\n{}",
-                    job.run_id,
-                    f.id,
-                    crate::render::finding_comment(f),
-                ),
-            }));
-        }
+        let patches = self.pr_patches(job).await?;
+        let comments: Vec<_> = findings.iter().filter_map(|finding| {
+            inline_comment(&job.run_id, finding, patches.get(&finding.location.path)?)
+        }).collect();
 
         let posted = comments.len();
         // The summary body is the already-rendered Markdown report (including
@@ -196,12 +178,8 @@ impl GitHub {
         Ok(posted)
     }
 
-    /// Fetch the PR's changed files and parse which (path, right-line) pairs
-    /// are present in the patch, so inline comments anchor to real diff lines.
-    async fn pr_patch_right_lines(
-        &self,
-        job: &ReviewJob,
-    ) -> Result<std::collections::HashSet<(String, u32)>> {
+    /// Read GitHub's patches to verify the entire selected range is commentable.
+    async fn pr_patches(&self, job: &ReviewJob) -> Result<HashMap<String, String>> {
         let files: Vec<PrFile> = self
             .get_builder(&format!(
                 "/repos/{}/{}/pulls/{}/files?per_page=100",
@@ -216,46 +194,24 @@ impl GitHub {
             .await
             .map_err(|_| err(Code::GitHub, "files decode failed"))?;
 
-        let mut set = std::collections::HashSet::new();
-        for file in files {
-            let Some(patch) = file.patch else { continue };
-            for (path, line) in right_lines(&file.filename, &patch) {
-                set.insert((path, line));
-            }
-        }
-        Ok(set)
+        Ok(files.into_iter().filter_map(|f| Some((f.filename, f.patch?))).collect())
     }
 }
 
-/// Parse `@@ ... +c,d @@` hunks and yield (path, right_line) for each added or
-/// context line on the right side (skipping `-` removals).
-fn right_lines(path: &str, patch: &str) -> Vec<(String, u32)> {
-    let mut out = Vec::new();
-    let mut right = 0u32;
-    for line in patch.lines() {
-        if let Some(h) = line.strip_prefix("@@ ") {
-            if let Some(plus) = h.split('+').nth(1) {
-                let start: u32 = plus
-                    .split([',', ' '])
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                right = start;
-            }
-            continue;
-        }
-        match line.chars().next() {
-            Some('+') => {
-                out.push((path.to_string(), right));
-                right += 1;
-            }
-            Some('-') | Some('\\') => {}
-            _ => {
-                right += 1;
-            }
-        }
+fn inline_comment(run_id: &str, finding: &Finding, patch: &str) -> Option<serde_json::Value> {
+    let loc = &finding.location;
+    crate::git::selected_lines(patch, loc.start_line, loc.end_line)?;
+    let mut comment = serde_json::json!({
+        "path": loc.path,
+        "line": loc.end_line,
+        "side": "RIGHT",
+        "body": format!("<!-- inkspect:{}:{} -->\n{}", run_id, finding.id, crate::render::finding_comment(finding)),
+    });
+    if loc.start_line != loc.end_line {
+        comment["start_line"] = loc.start_line.into();
+        comment["start_side"] = "RIGHT".into();
     }
-    out
+    Some(comment)
 }
 
 #[derive(Deserialize)]
@@ -283,4 +239,88 @@ struct PrFile {
     filename: String,
     #[serde(default)]
     patch: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::SourceRevision;
+    use crate::git::{ChangedFile, DiffSummary, LineEdit};
+    use serde_json::{Value, json};
+
+    const PATCH: &str = "@@ -8,2 +8,3 @@\n keep\n-old\n+    wrong();\n+    finish();\n@@ -20 +21 @@\n-old\n+later\n";
+
+    fn review(start: u32, end: u32, fix: Value) -> crate::domain::Report {
+        let diff = DiffSummary { files: vec![ChangedFile {
+            kind: "modified".into(), path: "src/lib.rs".into(), base_path: "src/lib.rs".into(),
+            edits: vec![LineEdit { base_start: 8, base_lines: 2, target_start: 8, target_lines: 3 }],
+            unknown: false, hunk_text: PATCH.into(), excerpt: String::new(),
+        }] };
+        let mut finding = json!({"title":"Incorrect call","reason":"Incorrect call in this branch",
+            "suggestion":"Correct the call","verification":"Check the result","severity":"P2",
+            "path":"src/lib.rs","start_line":start,"end_line":end});
+        if !fix.is_null() {
+            finding["code_fix"] = fix;
+        }
+        let raw = crate::model::parse_review(&json!({
+            "summary":"Review","decision":"needs_changes","findings":[finding]
+        }).to_string()).unwrap();
+        let rev = SourceRevision::default();
+        let mut report = crate::review::build_report("test", &rev, &rev, "test", "test", &diff, raw);
+        crate::render::attach(&mut report);
+        report
+    }
+
+    #[test]
+    fn concrete_fix_is_published_on_the_exact_selected_lines() {
+        let report = review(9, 10, json!({"original":["    wrong();","    finish();"],
+            "replacement":["\tcorrect();","    finish();",""]}));
+        let finding = &report.findings[0];
+        let presentation = report.presentation.as_ref().unwrap();
+        let body = &presentation.github_findings[&finding.id];
+        assert!(body.contains("\n\n```suggestion\n\tcorrect();\n    finish();\n\n```\n\n"));
+        assert!(!presentation.github_summary.contains("```suggestion"));
+        let comment = inline_comment("test", finding, PATCH).unwrap();
+        assert_eq!(comment["body"], format!("<!-- inkspect:test:{} -->\n{body}", finding.id));
+        assert_eq!(comment["start_line"], 9);
+        assert_eq!(comment["line"], 10);
+        assert_eq!(comment["start_side"], "RIGHT");
+        assert_eq!(comment["side"], "RIGHT");
+        assert!(inline_comment("test", finding, "@@ -8,2 +8,3 @@\n keep\n-old\n+    finish();\n").is_none());
+    }
+
+    #[test]
+    fn single_line_edits_preserve_deletions_and_literal_fences() {
+        for (replacement, expected) in [
+            (json!([]), "```suggestion\n```"),
+            (json!([""]), "```suggestion\n\n```"),
+            (json!(["```","@name <tag>"]), "````suggestion\n```\n@name <tag>\n````"),
+        ] {
+            let report = review(9, 9, json!({"original":["    wrong();"], "replacement":replacement}));
+            let comment = inline_comment("test", &report.findings[0], PATCH).unwrap();
+            assert!(comment["body"].as_str().unwrap().contains(expected));
+            assert_eq!(comment["line"], 9);
+            assert!(comment.get("start_line").is_none() && comment.get("start_side").is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_or_absent_edits_preserve_the_prose_finding() {
+        for (end, fix) in [
+            (9, Value::Null),
+            (9, json!({"original":["wrong();"],"replacement":["fixed();"]})),
+            (9, json!({"original":["    wrong();"],"replacement":["    wrong();"]})),
+            (9, json!({"original":["    wrong();"],"replacement":"prose"})),
+            (9, json!({"original":["    wrong();"],"replacement":["a\nb"]})),
+            (9, json!({"original":["    wrong();"],"replacement":["a".repeat(58_001)]})),
+            (21, json!({"original":["    wrong();","    finish();","later"],"replacement":[]})),
+        ] {
+            let report = review(9, end, fix);
+            let finding = &report.findings[0];
+            let body = &report.presentation.as_ref().unwrap().github_findings[&finding.id];
+            assert!(!body.contains("```suggestion"));
+            assert!(body.contains("**Suggested fix**\nCorrect the call"));
+            assert!(finding.replacement_lines.is_none());
+        }
+    }
 }

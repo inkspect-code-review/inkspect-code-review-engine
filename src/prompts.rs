@@ -92,7 +92,8 @@ OUTPUT SCHEMA (all fields required unless marked optional; no additional fields)
       "start_line": 1,
       "end_line": 1,
       "reason": "why this is a problem, grounded in the changed lines",
-      "suggestion": "concrete fix",
+      "suggestion": "concrete fix in prose",
+      "code_fix": { "original": ["exact selected source line"], "replacement": ["complete replacement line"] },
       "verification": "how a human can confirm the issue and the fix"
     }
   ],
@@ -104,6 +105,9 @@ OUTPUT SCHEMA (all fields required unless marked optional; no additional fields)
     "edges": [ { "from": "a", "to": "b", "label": "transition", "missing": false } ]
   }
 }
+
+INLINE CODE FIXES
+Choose the smallest meaningful inclusive target-side range showing the issue. Include code_fix only when replacing that exact range fully fixes the issue. Copy each selected target line, including indentation, into original, without diff markers. Supply the complete replacement as an array of source lines, preserving whitespace. An empty array deletes the selected lines. Omit code_fix for uncertain fixes, changes requiring edits elsewhere, or when either array would reveal a secret. Do not include explanations, patch markers, Markdown wrappers or placeholders in the replacement.
 
 PRIOR FINDINGS
 The optional untrusted_prior_findings array contains historical review data. For each item consider the original failure and all affected paths against the current changed source. Return a resolution only when you can positively verify the repair and cite the implementation line that demonstrates it. Missing findings, moved lines, promises, comments, tests alone, and partial fixes are insufficient. Omit uncertain or continuing items. Do not include source snippets, secrets, links or mentions in explanations. Return an empty array when no supplied item qualifies.

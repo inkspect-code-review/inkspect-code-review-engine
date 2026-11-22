@@ -85,6 +85,9 @@ pub struct Finding {
     pub severity: Severity,
     pub reason: String,
     pub suggestion: String,
+    /// Complete replacement lines for this exact location, when verified against the diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_lines: Option<Vec<String>>,
     pub verification: String,
     pub revision: SourceRevision,
     pub location: Location,
