@@ -30,6 +30,8 @@ pub enum Code {
     /// The model call failed, timed out, was truncated, or returned a response
     /// that did not match the required schema.
     Model,
+    /// The next review inference would exceed the operation budget.
+    ReviewBudget,
     /// The independent repair verifier could not establish a complete fix.
     FixVerification,
     /// The generator explicitly returned no safe repair, not a provider failure.
@@ -51,6 +53,7 @@ impl Code {
             Code::IgnoreInvalid => "source.invalid_ignore",
             Code::Retrieval => "retrieval.invalid",
             Code::Model => "model.failed",
+            Code::ReviewBudget => "review.budget_limit",
             Code::FixVerification => "fix.verification_failed",
             Code::FixNoSafeRepair => "fix.no_safe_repair",
             Code::Publish => "publish.failed",

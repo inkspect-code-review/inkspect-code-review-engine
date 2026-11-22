@@ -208,7 +208,7 @@ impl<'a> RequestLimits<'a> {
         let cost = input * u128::from(host.input_nano_usd)
             + host.model_max_output_tokens as u128 * u128::from(host.output_nano_usd);
         if cost > self.remaining {
-            return Err(err(Code::Model, "review inference budget exceeded"));
+            return Err(err(Code::ReviewBudget, "review inference budget exceeded"));
         }
         Ok(Some(cost))
     }
@@ -859,8 +859,8 @@ mod tests {
         for (budget, expected) in [(5095, vec![]), (2 * 5096 - 1, vec![8])] {
             let (result, seen) = run_small_hunk(budget).await;
             assert_eq!(
-                result.unwrap_err().reason,
-                "review inference budget exceeded"
+                result.unwrap_err().code.as_str(),
+                "review.budget_limit"
             );
             assert_eq!(seen, expected);
         }

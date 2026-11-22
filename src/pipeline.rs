@@ -249,8 +249,10 @@ pub async fn run(
         if request_bytes > limit {
             return Err(crate::error::err(Code::Model, "review request limit exceeded"));
         }
+    } else if host.budget_nano_usd > 0 && reserved > host.budget_nano_usd as u128 {
+        return Err(crate::error::err(Code::ReviewBudget, "review inference budget exceeded"));
     } else if host.budget_nano_usd > 0 && (host.model_input_allowance == 0
-        || host.model_max_output_tokens <= 0 || reserved > host.budget_nano_usd as u128
+        || host.model_max_output_tokens <= 0
         || request_bytes > limit) {
         return Err(crate::error::err(Code::Model, "model budget or request limit exceeded"));
     }

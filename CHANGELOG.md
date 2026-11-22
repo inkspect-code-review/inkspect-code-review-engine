@@ -24,6 +24,7 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 #### Fixed
 
 - Split a rejected review fragment down to individual diff lines before skipping it, preserving source coordinates.
+- Report a distinct failure code when the next review request exceeds the remaining inference budget.
 - Enforce the configured inference budget across all token-planned review requests.
 
 ### 2026-11-21
