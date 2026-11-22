@@ -13,6 +13,10 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ### 2026-11-22
 
+#### Changed
+
+- Show code quality and security scores alongside their rationales in a table in the review summary.
+
 #### Added
 
 - Offer GitHub's native commit suggestion for concrete fixes that match the selected lines of a pull request.
