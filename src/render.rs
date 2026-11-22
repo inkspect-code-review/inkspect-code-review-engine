@@ -112,14 +112,17 @@ fn render_markdown(report: &Report, omitted_findings: bool) -> String {
         ));
     }
 
-    // Quality scores as a stacked list (no table): a table wraps badly in
-    // narrow panels. Each area shows a visual bar, the n/5 value, and the
-    // reason. For any score below 5/5, a collapsible "AI prompt" block follows,
-    // combining the reason and the improvement so a user can hand it to an agent.
     if let Some(s) = &report.scores {
         b.push_str("### Scores\n\n");
-        b.push_str(&score_block("Code quality", &s.code_quality));
-        b.push_str(&score_block("Security", &s.security));
+        b.push_str("| Area | Score | Rationale |\n| --- | :---: | --- |\n");
+        for (area, score) in [("Code&nbsp;quality", &s.code_quality), ("Security", &s.security)] {
+            b.push_str(&format!(
+                "| **{area}** | {} | {} |\n",
+                score_bar(score.score),
+                md(&score.rationale),
+            ));
+        }
+        b.push('\n');
         b.push_str(&improvement_prompt("Code quality", &s.code_quality));
         b.push_str(&improvement_prompt("Security", &s.security));
     }
@@ -194,18 +197,7 @@ fn render_markdown(report: &Report, omitted_findings: bool) -> String {
 /// A 5-point score as filled/empty blocks plus the numeric value.
 fn score_bar(score: u8) -> String {
     let n = score.clamp(0, 5) as usize;
-    format!("{}{} {n}/5", "█".repeat(n), "░".repeat(5 - n))
-}
-
-/// A stacked score entry (no table). One bold line with the area, bar and
-/// value, then the reason on the next line. Renders cleanly at any width.
-fn score_block(area: &str, s: &crate::domain::Score) -> String {
-    let mut out = format!("**{}** {}\n", md(area), score_bar(s.score));
-    if !s.rationale.trim().is_empty() {
-        out.push_str(&format!("{}\n", md(&s.rationale)));
-    }
-    out.push('\n');
-    out
+    format!("{}{}&nbsp;**{n}/5**", "█".repeat(n), "░".repeat(5 - n))
 }
 
 /// For a sub-5 score, a collapsible block holding a ready-to-use prompt that
@@ -357,14 +349,17 @@ mod tests {
     }
 
     #[test]
-    fn scores_render_as_stacked_blocks_not_a_table() {
-        let md = markdown(&sample_report());
-        assert!(md.contains("### Scores"));
-        // Stacked, bold area + bar + value; no Markdown table pipes.
-        assert!(md.contains("**Code quality** "));
-        assert!(md.contains("4/5"));
-        assert!(!md.contains("| Area |"));
-        assert!(!md.contains("To reach 5/5"));
+    fn score_table_keeps_labels_and_ratings_together() {
+        let mut report = sample_report();
+        report.scores.as_mut().unwrap().code_quality.rationale = "Check A | B\non retry.".into();
+        assert!(markdown(&report).contains(concat!(
+            "### Scores\n\n",
+            "| Area | Score | Rationale |\n",
+            "| --- | :---: | --- |\n",
+            "| **Code&nbsp;quality** | ████░&nbsp;**4/5** | Check A \\| B on retry. |\n",
+            "| **Security** | █████&nbsp;**5/5** | No new external input. |\n\n",
+            "<details>",
+        )));
     }
 
     #[test]
