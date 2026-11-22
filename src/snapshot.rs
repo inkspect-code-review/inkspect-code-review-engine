@@ -329,6 +329,7 @@ pub async fn run(host: &HostConfig, input: Input) -> Result<Output> {
         head_sha: input.snapshot_id.clone(),
         head_ref: String::new(),
         review_notes: vec![],
+        prior_findings: vec![],
         publish_inline_comments: false,
         auto_review: false,
     };

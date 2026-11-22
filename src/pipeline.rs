@@ -1,8 +1,8 @@
-//! End-to-end review pipeline: clone -> diff -> retrieve -> single model call
+//! End-to-end review pipeline: clone -> diff -> retrieve -> review
 //! -> verify -> (optional) publish inline comments.
 //!
 //! This is the orchestration layer. Each step lives in its own module; this
-//! file wires them in order and owns the one-shot model interaction.
+//! file selects the request planning policy and publishes the final report.
 
 use std::path::Path;
 
@@ -77,11 +77,14 @@ pub async fn run(
 
     // Re-verify the PR snapshot against GitHub before doing any work.
     let gh = GitHub::with_tokens(read_token.clone(), write_token)?;
+    crate::telemetry::record(serde_json::json!({"kind":"source.snapshot.started"}))?;
     let snapshot = gh.verify_snapshot(job).await?;
     if snapshot.merge_base_sha != job.base_sha || snapshot.head_sha != job.head_sha {
         return Err(crate::error::err(Code::GitHubChanged, "snapshot drifted"));
     }
 
+    crate::telemetry::record(serde_json::json!({"kind":"source.snapshot.completed"}))?;
+    crate::telemetry::record(serde_json::json!({"kind":"source.clone.started"}))?;
     // Step 1: clone into the sandbox (or reuse a prepared clone for iteration).
     let token = read_token;
     let _clone_guard;
@@ -98,12 +101,16 @@ pub async fn run(
         }
     };
 
+    crate::telemetry::record(serde_json::json!({"kind":"source.clone.completed"}))?;
     // Step 2: diff between merge-base and head, scoped by the repository's
     // `.inkspectignore`. The policy comes from the trusted base, never from the
     // reviewed head, and an invalid one stops the run before any model call.
     let policy = ignore::load(&repo_dir, &job.base_sha, &token).await?;
-    let (diff, excluded_files): (DiffSummary, usize) =
-        git::diff_with_policy(&repo_dir, &job.base_sha, &job.head_sha, &token, policy.as_ref())
+    // The full diff, JSON envelopes and symbol index coexist while planning.
+    // Bound raw source reads using the worker's configured memory allowance.
+    let source_bytes = host.token_planned_review.then(|| u64::from(host.sandbox.memory_mib).saturating_mul(1024 * 1024) / 16);
+    let (mut diff, excluded_files): (DiffSummary, usize) =
+        git::scoped_diff(&repo_dir, &job.base_sha, &job.head_sha, &token, policy.as_ref(), source_bytes)
             .await?;
     crate::telemetry::record(serde_json::json!({
         "kind":"review.scope", "head":job.head_sha, "base":job.base_sha,
@@ -153,9 +160,31 @@ pub async fn run(
             );
             report.run.review_notes = job.review_notes.clone();
             crate::render::attach(&mut report);
+            crate::telemetry::record(serde_json::json!({"kind":"report.ready"}))?;
             publish(&gh, job, &report).await;
             return Ok(report);
         }
+    }
+
+    if host.token_planned_review {
+        let retrieved = match retrieve(host, job, &diff, &target, &repo_dir, &token, policy.as_ref()).await {
+            Ok(context) => context,
+            Err(e) => {
+                crate::telemetry::record(serde_json::json!({"kind":"review.retrieval_failed"}))?;
+                if host.require_indexed_context { return Err(e); }
+                Vec::new()
+            }
+        };
+        crate::telemetry::record(serde_json::json!({"kind":"review.context","revision":job.head_sha,
+            "sources": retrieved.iter().map(|r| serde_json::json!({"path":r.path,"start_line":r.start_line,"end_line":r.end_line})).collect::<Vec<_>>() }))?;
+        let model = ReviewModel::new(&host.model_region, &host.model_id, host.model_max_output_tokens).await?;
+        let report = crate::review_batches::run(&model, host, job, &snapshot.title, &snapshot.body, &diff, &retrieved, &target, &base).await?;
+        let mut report = review::with_exclusions(report, exclusions);
+        report.run.review_notes = job.review_notes.clone();
+        crate::render::attach(&mut report);
+        crate::telemetry::record(serde_json::json!({"kind":"report.ready"}))?;
+        publish(&gh, job, &report).await;
+        return Ok(report);
     }
 
     // Reserve the diff, instructions and review notes before allocating RAG.
@@ -163,14 +192,29 @@ pub async fn run(
     let nonce = prompts::new_nonce();
     let system = prompts::system_prompt(&nonce);
     let notes_json = serde_json::to_value(&job.review_notes).unwrap_or(serde_json::Value::Null);
-    let changed_files: Vec<_> = diff.files.clone();
-    let without_context = prompts::user_message(
-        &nonce, &snapshot.title, &snapshot.body, &diff, &changed_files, &[], &notes_json,
-    );
+    let limit = host.best_effort_review_bytes.unwrap_or(host.model_max_request_bytes);
+    let original_files = diff.files.len();
+    let make_message = |files: &[git::ChangedFile], context: &[crate::retrieval::Retrieved], prior: &[crate::config::PriorFinding]| {
+        prompts::user_message(&nonce, &snapshot.title, &snapshot.body, files, files, context, &notes_json, prior)
+    };
+    let mut prior = job.prior_findings.as_slice();
+    let mut without_context = make_message(&diff.files, &[], prior);
+    while !prior.is_empty() && limit > 0 && system.len() + without_context.len() + 4096 > limit {
+        prior = &prior[..prior.len() - 1];
+        without_context = make_message(&diff.files, &[], prior);
+    }
+    if host.best_effort_review_bytes.is_some() && system.len() + without_context.len() + 4096 > limit {
+        fit_changed_files(&mut diff.files, limit, |files| {
+            system.len() + make_message(files, &[], &[]).len() + 4096
+        });
+        without_context = make_message(&diff.files, &[], prior);
+        if original_files > 0 && diff.files.is_empty() {
+            return Err(crate::error::err(Code::Model, "no changed file fits the review request"));
+        }
+    }
     let mut retrieval_host = host.clone();
     retrieval_host.retrieval.content_bytes = crate::retrieval::review::available_bytes(
-        host.retrieval.content_bytes, host.model_max_request_bytes,
-        system.len() + without_context.len() + 4096,
+        host.retrieval.content_bytes, limit, system.len() + without_context.len() + 4096,
     );
     let retrieved = match retrieve(&retrieval_host, job, &diff, &target, &repo_dir, &token, policy.as_ref())
         .await
@@ -192,28 +236,26 @@ pub async fn run(
     // Step 4: the single hardened model call.
     let model = ReviewModel::new(&host.model_region, &host.model_id, host.model_max_output_tokens)
         .await?;
-    let user = prompts::user_message(
-        &nonce,
-        &snapshot.title,
-        &snapshot.body,
-        &diff,
-        &changed_files,
-        &retrieved,
-        &notes_json,
-    );
-
-    // Bedrock GPT profiles do not implement CountTokens. Reserve the complete
-    // operator-approved input allowance, as the previous engine did.
-    if host.budget_nano_usd > 0 {
-        let reserved = (host.model_input_allowance as u128) * (host.input_nano_usd as u128)
-            + (host.model_max_output_tokens as u128) * (host.output_nano_usd as u128);
-        if host.model_input_allowance == 0 || host.model_max_output_tokens <= 0
-            || reserved > host.budget_nano_usd as u128
-            || system.len() + user.len() + 4096 > host.model_max_request_bytes {
-            return Err(crate::error::err(Code::Model, "model budget or request limit exceeded"));
+    let user = make_message(&diff.files, &retrieved, prior);
+    let request_bytes = system.len() + user.len() + 4096;
+    let reserved = host.model_input_allowance as u128 * host.input_nano_usd as u128
+        + host.model_max_output_tokens.max(0) as u128 * host.output_nano_usd as u128;
+    if host.best_effort_review_bytes.is_some() {
+        crate::telemetry::record(serde_json::json!({
+            "kind": "review.estimate", "allowance_cost_nano_usd": reserved.to_string(),
+            "budget_nano_usd": host.budget_nano_usd, "request_bytes": request_bytes,
+            "request_limit_bytes": limit, "selected_files": diff.files.len(), "total_files": original_files,
+        }))?;
+        if request_bytes > limit {
+            return Err(crate::error::err(Code::Model, "review request limit exceeded"));
         }
+    } else if host.budget_nano_usd > 0 && (host.model_input_allowance == 0
+        || host.model_max_output_tokens <= 0 || reserved > host.budget_nano_usd as u128
+        || request_bytes > limit) {
+        return Err(crate::error::err(Code::Model, "model budget or request limit exceeded"));
     }
     let raw = model.review(&system, &user, job).await?;
+    let resolutions = review::verified_resolutions(prior, &diff, &raw);
 
     // Verify + assemble the report.
     let report = review::build_report(
@@ -226,13 +268,41 @@ pub async fn run(
         raw,
     );
     let mut report = review::with_exclusions(report, exclusions);
+    if diff.files.len() < original_files {
+        report.run.coverage_complete = false;
+        if matches!(report.decision, crate::domain::Decision::ReadyForReview) {
+            report.decision = crate::domain::Decision::NeedsEvidence;
+        }
+        report.presentation_notes.push(format!(
+            "Reviewed {} of {} changed files within the model request limit.", diff.files.len(), original_files
+        ));
+    }
+    report.resolved_findings = resolutions;
     report.run.review_notes = job.review_notes.clone();
     crate::render::attach(&mut report);
+    crate::telemetry::record(serde_json::json!({"kind":"report.ready"}))?;
     // Prompt provenance and the complete input are retained in the private
     // model-context capture, separate from the public report.
 
     publish(&gh, job, &report).await;
     Ok(report)
+}
+
+/// A file adds one entry to each of the changes and source arrays. Account
+/// for both separators and keep looking when a large file does not fit.
+fn fit_changed_files<T>(files: &mut Vec<T>, limit: usize, request_size: impl Fn(&[T]) -> usize) {
+    let empty = request_size(&[]);
+    let mut remaining = limit.saturating_sub(empty);
+    let mut separators = 0;
+    files.retain(|file| {
+        let cost = request_size(std::slice::from_ref(file)) - empty + separators;
+        if cost > remaining {
+            return false;
+        }
+        remaining -= cost;
+        separators = 2;
+        true
+    });
 }
 
 /// Optional step 5: publish the review to the PR. The summary body is the
@@ -340,4 +410,29 @@ fn review_focus(job: &ReviewJob) -> String {
         s.push_str(&n.body);
     }
     crate::retrieval::bounded(&s, 1800)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_review_keeps_later_files_that_fit_the_serialized_prompt() {
+        let file = |path: &str, hunk: String| git::ChangedFile {
+            path: path.into(), base_path: path.into(), kind: "modified".into(),
+            edits: vec![], unknown: false, hunk_text: hunk, excerpt: String::new(),
+        };
+        let first = file("first.rs", "\"\\\n".repeat(10));
+        let last = file("last.rs", "é".repeat(10));
+        let size = |files: &[git::ChangedFile]| {
+            prompts::user_message("nonce", "title", "", files, files, &[], &serde_json::json!([]), &[]).len()
+        };
+        let exact = size(&[first.clone(), last.clone()]);
+        let mut files = vec![first, file("huge.rs", "x".repeat(1_500_001)), last];
+        fit_changed_files(&mut files, exact, size);
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["first.rs", "last.rs"]);
+        assert_eq!(size(&files), exact);
+        fit_changed_files(&mut files, exact - 1, size);
+        assert_eq!(files.len(), 1);
+    }
 }

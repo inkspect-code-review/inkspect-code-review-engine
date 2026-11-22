@@ -36,6 +36,7 @@ mod ignore;
 mod index_progress;
 mod model;
 mod pipeline;
+mod review_batches;
 mod prompts;
 mod provider_usage;
 mod render;

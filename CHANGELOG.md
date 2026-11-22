@@ -11,6 +11,34 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-22
+
+#### Added
+
+- Offer GitHub's native commit suggestion for concrete fixes that match the selected lines of a pull request.
+
+#### Fixed
+
+- Split a rejected review fragment down to individual diff lines before skipping it, preserving source coordinates.
+- Enforce the configured inference budget across all token-planned review requests.
+
+### 2026-11-21
+
+#### Fixed
+
+- Allow reviews with an unlisted OpenAI model to split the input when the provider reports a context limit.
+- Retain verification gaps and incomplete coverage across review batches, giving blocking findings precedence in the combined decision.
+
+#### Added
+
+- Timestamp engine receipts and record revision checks, checkout preparation and report assembly.
+
+### 2026-11-20
+
+#### Added
+
+- Reassess supplied prior findings during PR review and return a specific explanation and changed source line for each verified repair.
+
 ### 2026-11-17
 
 #### Fixed

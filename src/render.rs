@@ -44,9 +44,22 @@ pub fn attach(report: &mut Report) {
 
 pub fn finding_comment(f: &Finding) -> String {
     let login = app_login(&std::env::var("INKSPECT_GITHUB_APP_SLUG").unwrap_or_default());
-    format!("**{} · {}**\n\n{}\n\n**Suggested fix**\n{}\n\n**Verification**\n{}\n\nComment `@{login} review again` after pushing your changes to request another review.",
+    let mut body = format!("**{} · {}**\n\n{}\n\n**Suggested fix**\n{}",
         severity_label(f.severity), md(&sanitize_text(&f.title, 500)), md(&sanitize_text(&f.reason, 3000)),
-        md(&sanitize_text(&f.suggestion, 3000)), md(&sanitize_text(&f.verification, 3000)))
+        md(&sanitize_text(&f.suggestion, 3000)));
+    let footer = format!("\n\n**Verification**\n{}\n\nNew pushes trigger an automatic review when enabled. To request another pass on the same commit, comment `@{login} review again`.",
+        md(&sanitize_text(&f.verification, 3000)));
+    if let Some(lines) = &f.replacement_lines {
+        let source = lines.join("\n");
+        let fence = code_fence(&source);
+        let last_newline = if lines.is_empty() { "" } else { "\n" };
+        let block = format!("\n\n{fence}suggestion\n{source}{last_newline}{fence}");
+        if body.len() + block.len() + footer.len() <= 58_000 {
+            body.push_str(&block);
+        }
+    }
+    body.push_str(&footer);
+    body
 }
 
 fn app_login(value: &str) -> String {
@@ -274,6 +287,11 @@ fn md(text: &str) -> String {
 /// Build a fenced code block whose fence is longer than any backtick run in the
 /// content, so content can never terminate the block early.
 fn fenced(language: &str, text: &str) -> String {
+    let fence = code_fence(text);
+    format!("{fence}{language}\n{}\n{fence}", text.trim_end_matches('\n'))
+}
+
+fn code_fence(text: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
     for c in text.chars() {
@@ -284,8 +302,7 @@ fn fenced(language: &str, text: &str) -> String {
             run = 0;
         }
     }
-    let fence = "`".repeat(longest.max(2) + 1);
-    format!("{fence}{language}\n{}\n{fence}", text.trim_end_matches('\n'))
+    "`".repeat(longest.max(2) + 1)
 }
 
 #[cfg(test)]
@@ -301,7 +318,7 @@ mod tests {
 
     fn sample_report() -> Report {
         Report {
-            presentation: None,
+            presentation: None, resolved_findings: Vec::new(),
             schema_version: "1".into(),
             run: ReviewRun {
                 id: "J-1".into(),
@@ -385,7 +402,7 @@ mod tests {
         report.run.review_notes.push(crate::config::ReviewNote { author: "@someone".into(), body: "Focus on validation".into() });
         report.diagram = Some(Diagram { title: "Flow".into(), view: "current".into(), evidence_ids: vec![],
             nodes: vec![DiagramNode { id: "injected-id".into(), label: "a\"] --> evil[\"b".into(), issue: false, evidence_ids: vec![] }], edges: vec![] });
-        report.findings.push(Finding { id: "F-1".into(), title: "<b>@user</b>".into(), severity: Severity::Medium,
+        report.findings.push(Finding { replacement_lines: None, id: "F-1".into(), title: "<b>@user</b>".into(), severity: Severity::Medium,
             reason: "A bug".into(), suggestion: "Fix it".into(), verification: "Check it".into(), advisory: None,
             revision: SourceRevision::default(), location: Location { path: "math.ts".into(), start_line: 3, end_line: 3 }, evidence_ids: vec![] });
         attach(&mut report);
@@ -406,7 +423,7 @@ mod tests {
     #[test]
     fn oversized_summary_preserves_full_report_and_never_claims_no_findings() {
         let mut report = sample_report();
-        report.findings.push(Finding { id: "F-large".into(), title: "Large finding".into(), severity: Severity::Medium,
+        report.findings.push(Finding { replacement_lines: None, id: "F-large".into(), title: "Large finding".into(), severity: Severity::Medium,
             reason: "界".repeat(30_000), suggestion: "Fix".into(), verification: "Test".into(), advisory: None,
             revision: SourceRevision::default(), location: Location { path: "math.ts".into(), start_line: 1, end_line: 1 }, evidence_ids: vec![] });
         attach(&mut report);

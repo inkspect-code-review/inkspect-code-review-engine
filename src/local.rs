@@ -462,10 +462,11 @@ pub async fn run(host: &HostConfig, path: &Path, base: Option<&str>) -> Result<R
             &nonce,
             "Local code review",
             "No pull request metadata is available.",
-            &snapshot.diff,
+            &snapshot.diff.files,
             &snapshot.diff.files,
             &[],
             &serde_json::json!([]),
+            &[],
         );
         let limit = if host.model_max_request_bytes == 0 {
             1_500_000
@@ -492,6 +493,7 @@ pub async fn run(host: &HostConfig, path: &Path, base: Option<&str>) -> Result<R
             head_sha: snapshot.target.revision_id.clone(),
             head_ref: String::new(),
             review_notes: vec![],
+        prior_findings: vec![],
             publish_inline_comments: false,
             auto_review: false,
         };

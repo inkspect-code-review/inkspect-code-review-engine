@@ -11,6 +11,9 @@ pub struct Provider {
     pub provider: String,
     pub model: String,
     api_key: String,
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) test_port: Option<u16>,
     pub max_output_tokens: i32,
 }
 impl Provider {
@@ -37,9 +40,73 @@ impl Provider {
             _ => ("https://generativelanguage.googleapis.com", json!({"systemInstruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":[{"text":user}]}],"generationConfig":{"maxOutputTokens":max,"responseMimeType":"application/json"}})),
         }
     }
+    fn client(&self) -> Result<reqwest::Client> {
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never()).timeout(std::time::Duration::from_secs(180))
+            .build().map_err(|_| err(Code::Model, "provider client unavailable"))
+    }
+
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.provider.as_str() {
+            "openai" => req.bearer_auth(&self.api_key),
+            "anthropic" => req.header("anthropic-version","2023-06-01").header("x-api-key",&self.api_key),
+            _ => req.header("x-goog-api-key",&self.api_key),
+        }
+    }
+
+    pub async fn input_limit(&self, output: i32) -> Result<Option<usize>> {
+        let (url, field) = match self.provider.as_str() {
+            "openai" => return Ok(None),
+            "anthropic" => (format!("https://api.anthropic.com/v1/models/{}", self.model), "max_input_tokens"),
+            "google" => (format!("https://generativelanguage.googleapis.com/v1beta/models/{}", self.model), "inputTokenLimit"),
+            _ => return Err(err(Code::Model,"unknown model context window")),
+        };
+        let value = self.metadata(self.client()?.get(url)).await?;
+        let limit = value[field].as_u64().and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| err(Code::Model,"missing model context window"))?;
+        let available = if self.provider == "anthropic" { limit.saturating_sub(output as usize) } else { limit };
+        if available == 0 { return Err(err(Code::Model,"invalid model context window")); }
+        Ok(Some(available))
+    }
+
+    async fn metadata(&self, request: reqwest::RequestBuilder) -> Result<Value> {
+        let response = self.authorize(request).send().await
+            .and_then(|r| r.error_for_status()).map_err(|_|err(Code::Model,"model token metadata unavailable"))?;
+        response.json().await.map_err(|_|err(Code::Model,"invalid model token metadata"))
+    }
+
+    pub async fn count_input(&self, system: &str, user: &str) -> Result<usize> {
+        let (url, body, field) = match self.provider.as_str() {
+            "openai" => ("https://api.openai.com/v1/responses/input_tokens".into(),
+                json!({"model":self.model,"instructions":system,"input":user}), "input_tokens"),
+            "anthropic" => ("https://api.anthropic.com/v1/messages/count_tokens".into(),
+                json!({"model":self.model,"system":system,"messages":[{"role":"user","content":user}]}), "input_tokens"),
+            _ => {
+                let (_, mut body) = self.payload(system,user,self.max_output_tokens);
+                body["model"] = json!(format!("models/{}", self.model));
+                (format!("https://generativelanguage.googleapis.com/v1beta/models/{}:countTokens", self.model),
+                    json!({"generateContentRequest":body}), "totalTokens")
+            }
+        };
+        let request = self.client()?.post(url).json(&body);
+        let response=self.authorize(request).send().await.map_err(|_|err(Code::Model,"provider token count unavailable"))?;
+        let status=response.status().as_u16();
+        if status==413 {return Ok(usize::MAX);}
+        let value: Value=response.json().await.map_err(|_|err(Code::Model,"invalid provider token count"))?;
+        if status==400 && (value["error"]["code"]=="context_length_exceeded" ||
+            value["error"]["message"].as_str().is_some_and(crate::model::is_context_rejection)) { return Ok(usize::MAX); }
+        if status!=200 {return Err(err(Code::Model,"provider token count unavailable"));}
+        value[field].as_u64().and_then(|v| usize::try_from(v).ok()).filter(|n| *n>0)
+            .ok_or_else(|| err(Code::Model,"invalid provider token count"))
+    }
     pub async fn complete(&self, system: &str, user: &str, max: i32, receipt: usize) -> Result<String> {
         let (host, body) = self.payload(system,user,max);
         let url = if self.provider=="google" {format!("{host}/v1beta/models/{}:generateContent",self.model)} else {host.into()};
+        #[cfg(test)]
+        let url = match self.test_port {
+            Some(port) => format!("http://127.0.0.1:{port}/v1/responses"),
+            None => url,
+        };
         let client=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never())
             .timeout(std::time::Duration::from_secs(180)).build().map_err(|_|err(Code::Model,"provider client unavailable"))?;
         let (header, secret) = match self.provider.as_str() {"openai"=>("authorization",format!("Bearer {}",self.api_key)),"anthropic"=>("x-api-key",self.api_key.clone()),_=>("x-goog-api-key",self.api_key.clone())};
@@ -79,6 +146,10 @@ impl Provider {
             }
         }
         crate::audit::capture_model_receipt(receipt,&response_receipt(&self.provider,status,request_id.as_deref(),"received",&bytes,&self.api_key))?;
+        if status == 413 || (status == 400 && parsed.as_ref().is_ok_and(|v|
+            v["error"]["code"] == "context_length_exceeded" || v["error"]["message"].as_str().is_some_and(crate::model::is_context_rejection))) {
+            return Err(crate::model::context_rejection(receipt));
+        }
         if !(200..300).contains(&status) {return Err(err(Code::Model,"provider rejected the request"));}
         let result=parsed.map_err(|_|err(Code::Model,"invalid provider response"))?;
 
@@ -150,7 +221,7 @@ mod tests {
     }
     #[test] fn request_envelopes_keep_instructions_outside_untrusted_input() {
         for provider in ["openai","anthropic","google"] {
-            let p=Provider{provider:provider.into(),model:"test-model".into(),api_key:"secret".into(),max_output_tokens:1024};
+            let p=Provider{provider:provider.into(),model:"test-model".into(),api_key:"secret".into(),test_port:None,max_output_tokens:1024};
             let (url,v)=p.payload("trusted","untrusted",1024);
             assert!(url.starts_with("https://")); assert!(!v.to_string().contains("secret"));
             if provider=="openai" {assert_eq!(v["store"],false);assert_eq!(v["instructions"],"trusted");}
