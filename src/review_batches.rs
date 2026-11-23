@@ -1,5 +1,5 @@
 //! Token-aware review of a pinned PR. One result is published after all parts succeed.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::config::{HostConfig, ReviewJob};
 use crate::domain::{Decision, Report, SourceRevision, VerificationGap};
@@ -140,6 +140,7 @@ impl<'a> Links<'a> {
 }
 
 struct Prompt<'a> {
+    scoped: Option<&'a crate::retrieval::pull::Context>,
     nonce: String,
     title: &'a str,
     body: &'a str,
@@ -153,7 +154,14 @@ impl Prompt<'_> {
         files: &[ChangedFile],
         context: &[Retrieved],
         links: Option<&Value>,
+        summaries: Option<&BTreeMap<&str, Value>>,
     ) -> String {
+        let mut linked;
+        let links = if let Some(scoped) = self.scoped {
+            linked = links.cloned().unwrap_or_else(|| json!({}));
+            linked["matching_evidence"] = json!(scoped.select(files));
+            Some(&linked)
+        } else { links };
         prompts::user_message_with_links(
             &self.nonce,
             self.title,
@@ -164,6 +172,7 @@ impl Prompt<'_> {
             &self.notes,
             &self.job.prior_findings,
             links,
+            summaries,
         )
     }
 }
@@ -214,6 +223,7 @@ impl<'a> RequestLimits<'a> {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     model: &ReviewModel,
@@ -226,7 +236,24 @@ pub async fn run(
     target: &SourceRevision,
     base: &SourceRevision,
 ) -> Result<Report> {
+    run_with_context(model,host,job,title,body,diff,retrieved,target,base,None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_context(
+    model: &ReviewModel,
+    host: &HostConfig,
+    job: &ReviewJob,
+    title: &str,
+    body: &str,
+    diff: &DiffSummary,
+    retrieved: &[Retrieved],
+    target: &SourceRevision,
+    base: &SourceRevision,
+    scoped: Option<&crate::retrieval::pull::Context>,
+) -> Result<Report> {
     let prompt = Prompt {
+        scoped,
         nonce: prompts::new_nonce(),
         title,
         body,
@@ -234,16 +261,47 @@ pub async fn run(
         job,
     };
     let system = prompts::system_prompt(&prompt.nonce);
-    // Each successful review consumes at least one file or one hunk segment.
-    // Record the upper bound before inference for crash-safe usage settlement.
+    let summaries: BTreeMap<_, _> = if scoped.is_none() && job.prior_findings.is_empty() {
+        diff.files
+            .iter()
+            .filter_map(|file| {
+                crate::validation_json::summarize(file).map(|value| (file.path.as_str(), value))
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    // The optional summary pass and subsequent raw parts share one admission.
     let maximum = diff
         .files
         .iter()
         .map(|f| 1 + f.hunk_text.lines().count())
         .sum::<usize>()
-        .max(1);
+        .max(1)
+        + if summaries.is_empty() {
+            0
+        } else {
+            diff.files.len()
+        };
     crate::telemetry::record(json!({"kind":"review.plan","parts_limit":maximum}))?;
     let mut limits = RequestLimits::new(model.input_limit().await?, host);
+    if !summaries.is_empty() {
+        if let Some(report) = review_summaries(
+            model,
+            &prompt,
+            &system,
+            diff,
+            &summaries,
+            retrieved,
+            target,
+            base,
+            &mut limits,
+        )
+        .await?
+        {
+            return Ok(report);
+        }
+    }
     let mut report = if let Some(raw) = attempt(
         model,
         &prompt,
@@ -290,8 +348,9 @@ pub async fn run(
             )
             .await?;
             if raw.is_none() && files.len() == 1 {
-                raw = attempt(model, &prompt, &system, files, &[], None, &mut limits).await?;
-                if raw.is_some() && units.len() > 1 {
+                let bare = Prompt { scoped: None, nonce: prompt.nonce.clone(), notes: prompt.notes.clone(), ..prompt };
+                raw = attempt(model, &bare, &system, files, &[], None, &mut limits).await?;
+                if raw.is_some() && (units.len() > 1 || scoped.is_some()) {
                     missing_links += 1;
                 }
             }
@@ -403,6 +462,56 @@ fn verified_report(
     report
 }
 
+// Keep complete JSON documents together across batches. A provisional concern
+// in any batch discards the entire preview; the raw planner owns the final report.
+#[allow(clippy::too_many_arguments)]
+async fn review_summaries(
+    model: &ReviewModel,
+    prompt: &Prompt<'_>,
+    system: &str,
+    diff: &DiffSummary,
+    summaries: &BTreeMap<&str, Value>,
+    retrieved: &[Retrieved],
+    target: &SourceRevision,
+    base: &SourceRevision,
+    limits: &mut RequestLimits<'_>,
+) -> Result<Option<Report>> {
+    let links = std::cell::OnceCell::new();
+    let mut pending = vec![(0, diff.files.len())];
+    let mut reports = Vec::new();
+    while let Some((start, end)) = pending.pop() {
+        let files = &diff.files[start..end];
+        let related = (files.len() != diff.files.len()).then(|| {
+            links
+                .get_or_init(|| Links::new(&diff.files))
+                .context(start, end)
+        });
+        let user = prompt.message(files, retrieved, related.as_ref(), Some(summaries));
+        let Some(raw) = infer_if_fits(model, prompt.job, system, &user, limits).await? else {
+            if files.len() == 1 {
+                return Ok(None);
+            }
+            let mid = start + split_point(files);
+            pending.extend([(mid, end), (start, mid)]);
+            continue;
+        };
+        if !raw.findings.is_empty()
+            || !raw.resolved_findings.is_empty()
+            || !matches!(raw.decision.as_str(), "ready" | "ready_for_review")
+        {
+            return Ok(None);
+        }
+        reports.push(verified_report(model, prompt.job, target, base, diff, raw));
+    }
+    let mut report = combine(reports)?;
+    report.presentation_notes.push(format!(
+        "Reviewed {} added validation JSON file(s) using sampled values and field counts.",
+        summaries.len()
+    ));
+    note_binary_files(&mut report, diff);
+    Ok(Some(report))
+}
+
 async fn attempt(
     model: &ReviewModel,
     prompt: &Prompt<'_>,
@@ -413,19 +522,9 @@ async fn attempt(
     limits: &mut RequestLimits<'_>,
 ) -> Result<Option<crate::model::RawReview>> {
     loop {
-        let user = prompt.message(files, retrieved, related);
-        let tokens = if limits.window.is_some() || limits.budget.is_some() {
-            model.count_input(system, &user).await?
-        } else {
-            None
-        };
-        if let Some(cost) = limits.reservation(tokens, system.len() + user.len() + 4096)? {
-            limits.remaining -= cost;
-            match model.review(system, &user, prompt.job).await {
-                Ok(raw) => return Ok(Some(raw)),
-                Err(e) if e.reason == CONTEXT_LIMIT => limits.remaining += cost,
-                Err(e) => return Err(e),
-            }
+        let user = prompt.message(files, retrieved, related, None);
+        if let Some(raw) = infer_if_fits(model, prompt.job, system, &user, limits).await? {
+            return Ok(Some(raw));
         }
         if retrieved.is_empty() {
             return Ok(None);
@@ -434,10 +533,43 @@ async fn attempt(
     }
 }
 
+async fn infer_if_fits(
+    model: &ReviewModel,
+    job: &ReviewJob,
+    system: &str,
+    user: &str,
+    limits: &mut RequestLimits<'_>,
+) -> Result<Option<crate::model::RawReview>> {
+    let tokens = if limits.window.is_some() || limits.budget.is_some() {
+        model.count_input(system, user).await?
+    } else {
+        None
+    };
+    let Some(cost) = limits.reservation(tokens, system.len() + user.len() + 4096)? else {
+        return Ok(None);
+    };
+    limits.remaining -= cost;
+    match model.review(system, user, job).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.reason == CONTEXT_LIMIT => {
+            limits.remaining += cost;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // Partition very large text diffs on line boundaries, preserving both base and
 // head coordinates in synthetic unified hunk headers. Never cut a UTF-8 line.
 fn fragments(file: &ChangedFile, piece_bytes: usize) -> Vec<ChangedFile> {
     if file.hunk_text.len() <= piece_bytes {
+        return vec![file.clone()];
+    }
+    hunk_fragments(file, piece_bytes)
+}
+
+pub(crate) fn hunk_fragments(file: &ChangedFile, piece_bytes: usize) -> Vec<ChangedFile> {
+    if file.edits.is_empty() {
         return vec![file.clone()];
     }
     let mut parts = Vec::new();
@@ -863,6 +995,128 @@ mod tests {
                 "review.budget_limit"
             );
             assert_eq!(seen, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_summary_never_publishes_preliminary_findings() {
+        for (preliminary, budget, expected_calls) in [
+            ("ready", 5096, 1),
+            ("candidate", 10192, 2),
+            ("needs_evidence", 10192, 2),
+            ("candidate", 5096, 1),
+            ("split", 10192, 2),
+            ("confirmed", 10192, 2),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut calls = 0;
+                for connection in listener.incoming() {
+                    let mut stream = connection.unwrap();
+                    if stream.peek(&mut [0]).unwrap() == 0 {
+                        break;
+                    }
+                    let (request, body) = read_request(&stream);
+                    let response = if request.contains("/count-tokens ") {
+                        let msg=body["input"]["converse"]["messages"][0]["content"][0]["text"].as_str().unwrap();
+                        let payload:Value=serde_json::from_str(msg.lines().nth(1).unwrap()).unwrap();
+                        let split=preliminary=="split" && payload["changes"].as_array().unwrap().len()>1;
+                        json!({"inputTokens": if split {923000} else {1000}})
+                    } else {
+                        calls += 1;
+                        let user = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+                        let payload: Value = serde_json::from_str(user.lines().nth(1).unwrap()).unwrap();
+                        let source = &payload["untrusted_changed_source"][0];
+                        assert_eq!(payload["untrusted_retrieved_context"][0]["content"],"same source");
+                        let raw = if calls == 1 || preliminary == "split" {
+                            assert_eq!(source["validation_summary"]["passed_true"], 900);
+                            assert!(source.get("hunk").is_none());
+                            let findings = if matches!(preliminary, "candidate" | "confirmed") {
+                                json!([{"severity":"P1","title":"Unconfirmed","reason":"Unconfirmed","suggestion":"Check","verification":"Check","path":"docs/validation/results.json","start_line":1,"end_line":1}])
+                            } else {json!([])};
+                            json!({"summary":"Sampled","decision":if preliminary=="split" {"ready"} else {preliminary},"findings":findings})
+                        } else {
+                            assert!(source["hunk"].as_str().unwrap().contains("+    \"passed\": true"));
+                            assert!(source.get("validation_summary").is_none());
+                            let findings = if preliminary=="confirmed" {
+                                json!([{"severity":"P1","title":"Raw source finding","reason":"Original rows checked","suggestion":"Check","verification":"Check","path":"docs/validation/results.json","start_line":3,"end_line":3}])
+                            } else {json!([])};
+                            json!({"summary":"Reviewed original source","decision":"ready","findings":findings})
+                        };
+                        json!({"output":{"message":{"role":"assistant","content":[{"text":raw.to_string()}]}},
+                          "stopReason":"end_turn","usage":{"inputTokens":1000,"outputTokens":10,"totalTokens":1010},"metrics":{"latencyMs":1}})
+                    }.to_string();
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                }
+                calls
+            });
+            let config = Config::builder()
+                .behavior_version_latest()
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new("fixture", "fixture", None, None, "test"))
+                .retry_config(aws_config::retry::RetryConfig::disabled())
+                .endpoint_url(format!("http://{address}"))
+                .build();
+            let model = ReviewModel::with_test_client(Client::from_conf(config));
+            let mut host = host();
+            host.model_max_output_tokens = 4096;
+            host.model_input_allowance = 922_000;
+            host.model_max_request_bytes = 256 * 1024;
+            host.input_nano_usd = 1;
+            host.output_nano_usd = 1;
+            host.budget_nano_usd = budget;
+            let job: ReviewJob =
+                serde_json::from_str(include_str!("../examples/job.example.json")).unwrap();
+            let raw = serde_json::to_string_pretty(&vec![json!({"passed":true}); 900]).unwrap();
+            let mut diff = DiffSummary {
+                files: vec![crate::validation_json::fixture(&raw)],
+            };
+            if preliminary == "split" {
+                let mut second = diff.files[0].clone();
+                second.path = "docs/validation/other.json".into();
+                diff.files.push(second);
+            }
+            let retrieved = vec![Retrieved {
+                path: "src/check.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                content: "same source".into(),
+            }];
+            let target = job.target_revision();
+            let result = run(
+                &model,
+                &host,
+                &job,
+                "New results",
+                "",
+                &diff,
+                &retrieved,
+                &target,
+                &target,
+            )
+            .await;
+            drop(std::net::TcpStream::connect(address).unwrap());
+            assert_eq!(server.join().unwrap(), expected_calls);
+            if preliminary == "candidate" && expected_calls == 1 {
+                assert_eq!(result.unwrap_err().code.as_str(), "review.budget_limit");
+            } else {
+                let report = result.unwrap();
+                if preliminary == "confirmed" {
+                    assert_eq!(report.findings.len(), 1);
+                    assert_eq!(report.findings[0].title, "Raw source finding");
+                } else {
+                    assert!(report.findings.is_empty());
+                }
+                if expected_calls == 2 && preliminary != "split" {
+                    assert_eq!(report.summary, "Reviewed original source");
+                } else {
+                    assert!(report
+                        .presentation_notes
+                        .iter()
+                        .any(|n| n.contains("sampled values")));
+                }
+            }
         }
     }
 

@@ -157,7 +157,7 @@ pub async fn verify_candidate(host: &HostConfig, job: &ReviewJob, request: Value
         }
     }
     let system=format!("{system} Large supporting files may be supplied in supporting_file_changes as exact numbered original/proposed spans. Only byte-identical lines are omitted. Inspect every changed span and use the supplied proposed_start_line for evidence. If omitted context is needed to establish closure, return uncertain.");
-    let user=format!("{nonce}\n{}\n{nonce}",json!({"findings":report.findings,"original_files":original,"proposed_files":proposed,"supporting_file_changes":supporting_changes,"executed_checks_and_gaps":request["checks"],"changed_paths":files.iter().map(|f|&f["path"]).collect::<Vec<_>>()}));
+    let user=format!("{nonce}\n{}\n{nonce}",json!({"findings":report.findings,"original_files":original,"proposed_files":proposed,"supporting_file_changes":supporting_changes,"executed_checks_and_gaps":request["checks"],"changed_file_line_counts":crate::fix_verification::changed_file_line_counts(files)?}));
     if !request_fits(host,&system,&user) {return Err(err(Code::FixVerification,"verification context exceeds operation budget"));}
     let digest=crate::fix_verification::candidate_hash(&job.run_id,&job.head_sha,&report.run.id,files)?;
     crate::telemetry::record(json!({"kind":"fix.verification.started","attempt":attempt,"candidate_sha256":digest}))?;
@@ -221,7 +221,7 @@ where F: FnMut(bool, usize, String, String) -> Fut,
         // The verifier receives no prior verdicts or generator reasoning. It
         // must reassess every original finding against the cumulative patch.
         let user = format!("{nonce}\n{}\n{nonce}", json!({"findings":findings,"original_files":original,"proposed_files":current,
-            "changed_paths":changed.iter().map(|f| &f["path"]).collect::<Vec<_>>()}));
+            "changed_file_line_counts":crate::fix_verification::changed_file_line_counts(&changed)?}));
         if !request_fits(&limits, &system, &user) { return Err(err(Code::FixVerification,"verification context exceeds operation budget")); }
         crate::telemetry::record(json!({"kind":"fix.verification.started","attempt":attempt,"candidate_sha256":digest}))?;
         let raw = call(true, attempt, system, user).await?;

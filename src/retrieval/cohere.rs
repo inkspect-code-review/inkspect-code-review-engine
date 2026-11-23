@@ -15,7 +15,11 @@ use aws_sdk_bedrockruntime::Client;
 use super::{Embedder, Reranker};
 use crate::error::{err, Code, Result};
 
+const THROTTLED: &str = "embedding throttled";
+const TRANSIENT: &str = "embedding service unavailable";
+
 pub struct Bedrock {
+    document_rate: super::embedding_rate::DocumentRate,
     embed_client: Client,
     rerank_client: Client,
     embed_model: String,
@@ -44,6 +48,7 @@ impl Bedrock {
             .load()
             .await;
         Ok(Bedrock {
+            document_rate: super::embedding_rate::DocumentRate::new(embed_region, embed_model),
             embed_client: Client::new(&embed_cfg),
             rerank_client: Client::new(&rerank_cfg),
             embed_model: embed_model.to_string(),
@@ -70,6 +75,9 @@ impl Bedrock {
         if total > 120_000 {
             return Err(err(Code::Retrieval, "embedding batch too large"));
         }
+        if input_type == "search_document" {
+            self.document_rate.acquire(total).await?;
+        }
         let body = serde_json::json!({
             "texts": texts,
             "input_type": input_type,
@@ -94,7 +102,13 @@ impl Bedrock {
                 let _ = usage.record("embedding.failed", receipt, None);
                 let detail = aws_smithy_types::error::display::DisplayErrorContext(&e);
                 tracing::debug!(texts = texts.len(), "embedding call failed: {detail}");
-                err(Code::Retrieval, "embedding call failed")
+                let status = e.raw_response().map(|r| r.status().as_u16());
+                let reason = match status {
+                    Some(429) => THROTTLED,
+                    Some(500..=599) | None => TRANSIENT,
+                    _ => "embedding call failed",
+                };
+                err(Code::Retrieval, reason)
             })?;
 
         usage.record("embedding.response", receipt, None)?;
@@ -132,23 +146,21 @@ impl Bedrock {
             .ok_or_else(|| err(Code::Retrieval, "empty embedding response"))
     }
 
-    /// Embed repository chunks as documents (input_type "search_document"),
-    /// retrying on throttling with generous exponential backoff. Bedrock
-    /// enforces a tokens-per-minute quota, so backoff starts in the seconds.
+    /// Both PR and repository document batches reserve budget before each attempt.
     pub async fn embed_documents_async(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut attempt = 0u32;
         loop {
             match self.embed_batch(texts, "search_document").await {
-                Ok(v) => return Ok(v),
-                Err(e) if attempt < 7 => {
-                    attempt += 1;
-                    // 4s, 8s, 16s, 32s, 60s, 60s, 60s.
-                    let secs = (4u64 << (attempt - 1)).min(60);
-                    tracing::debug!(attempt, "throttled; retrying document embedding in {secs}s: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                Err(e) if e.reason == THROTTLED => {
+                    self.document_rate.throttled()?;
+                    if attempt >= 3 { return Err(e); }
                 }
-                Err(e) => return Err(e),
+                Err(e) if e.reason == TRANSIENT && attempt < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(4 << attempt)).await;
+                }
+                result => return result,
             }
+            attempt += 1;
         }
     }
 

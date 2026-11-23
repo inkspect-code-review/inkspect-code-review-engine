@@ -64,7 +64,7 @@ impl Qdrant {
         format!("/collections/{}", schema.collection())
     }
 
-    async fn post<B: serde::Serialize>(&self, route: &str, body: &B) -> Result<serde_json::Value> {
+    pub(super) async fn post<B: serde::Serialize>(&self, route: &str, body: &B) -> Result<serde_json::Value> {
         let mut req = self
             .client
             .post(format!("{}{}", self.endpoint, route))
@@ -144,7 +144,7 @@ impl Qdrant {
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<Chunk>> {
-        self.query_inner(ns, schema, snapshot, vector, limit, false)
+        Ok(self.query_inner(ns, schema, snapshot, vector, limit, false)?.into_iter().map(|(chunk, _)| chunk).collect())
     }
 
     /// Inspection samples files, so a long generated file cannot occupy the
@@ -153,13 +153,13 @@ impl Qdrant {
         &self, ns: &Namespace, schema: &Schema, snapshot: &str,
         vector: &[f32], limit: usize,
     ) -> Result<Vec<Chunk>> {
-        self.query_inner(ns, schema, snapshot, vector, limit, true)
+        Ok(self.query_inner(ns, schema, snapshot, vector, limit, true)?.into_iter().map(|(chunk, _)| chunk).collect())
     }
 
-    fn query_inner(
+    pub(super) fn query_inner(
         &self, ns: &Namespace, schema: &Schema, snapshot: &str,
         vector: &[f32], limit: usize, grouped: bool,
-    ) -> Result<Vec<Chunk>> {
+    ) -> Result<Vec<(Chunk, f64)>> {
         let filter = serde_json::json!({
             "must": [
                 {"key": "kind", "match": {"value": "chunk"}},
@@ -223,7 +223,7 @@ impl Qdrant {
             if p.id != expected {
                 return Err(err(Code::Retrieval, "chunk point id mismatch"));
             }
-            chunks.push(chunk);
+            chunks.push((chunk, p.score));
         }
         Ok(chunks)
     }
@@ -265,7 +265,7 @@ impl Qdrant {
     // Rust engine writes is byte-for-byte acceptable to the Go read path (and
     // to this engine's own reader above).
 
-    async fn put(&self, route: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(super) async fn put(&self, route: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let mut req = self
             .client
             .put(format!("{}{}", self.endpoint, route))
@@ -293,10 +293,10 @@ impl Qdrant {
         Ok(envelope.result)
     }
 
-    async fn get_collection(&self, schema: &Schema) -> Result<Option<serde_json::Value>> {
+    async fn get_collection(&self, route: &str) -> Result<Option<serde_json::Value>> {
         let mut req = self
             .client
-            .get(format!("{}{}", self.endpoint, self.collection_route(schema)));
+            .get(format!("{}{}", self.endpoint, route));
         if let Some(key) = &self.api_key {
             req = req.header("api-key", key);
         }
@@ -320,7 +320,11 @@ impl Qdrant {
     /// Ensure the collection exists with the exact size/distance/metadata the Go
     /// engine requires. Creates it if missing (create=true).
     pub async fn ensure(&self, schema: &Schema) -> Result<()> {
-        if let Some(cfg) = self.get_collection(schema).await? {
+        self.ensure_at(schema, &self.collection_route(schema)).await
+    }
+
+    pub(super) async fn ensure_at(&self, schema: &Schema, route: &str) -> Result<()> {
+        if let Some(cfg) = self.get_collection(route).await? {
             let size = cfg
                 .pointer("/config/params/vectors/size")
                 .and_then(|v| v.as_i64())
@@ -344,7 +348,12 @@ impl Qdrant {
                 "normalize": schema.normalize,
             }},
         });
-        self.put(&self.collection_route(schema), &body).await?;
+        if let Err(e) = self.put(route, &body).await {
+            // Another worker may have created this collection concurrently.
+            let concurrent = self.get_collection(route).await?;
+            if !concurrent.is_some_and(|cfg| cfg.pointer("/config/params/vectors/size").and_then(|v|v.as_i64()) == Some(schema.dimensions)
+                && cfg.pointer("/config/params/vectors/distance").and_then(|v|v.as_str()) == Some("Cosine")) { return Err(e); }
+        }
         Ok(())
     }
 
@@ -425,6 +434,8 @@ struct QdrantEnvelope {
 
 #[derive(Deserialize)]
 struct RawPoint {
+    #[serde(default)]
+    score: f64,
     #[serde(default)]
     id: String,
     #[serde(default)]

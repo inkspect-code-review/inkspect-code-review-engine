@@ -1,5 +1,5 @@
 //! Independent, fail-closed review of the exact candidate before publication.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -34,7 +34,15 @@ pub fn system(nonce: &str) -> String {
 Compare original and proposed source against EVERY supplied finding. Decide whether the underlying failure is actually prevented, not merely whether the suggested edit was copied. Trace the failure scenario and nearby bypasses, error paths, security boundaries and regressions introduced by the patch. Consider filesystem links and races when relevant, integer boundaries, validation bypasses, and removed or weakened protections. Keep the original finding's evidenced threat model and required behavior fixed. A bypass must work with the attacker inputs, permissions and trust boundaries supported by the original finding and supplied source. State those preconditions in the rejection reason. Do not reject a repair solely for a pre-existing independent weakness requiring stronger attacker privileges, control of additional trusted resources, or an unsupported platform assumption. For example, control of an entry inside a configured directory does not by itself establish permission to replace that directory through its parent. Still reject races within the evidenced boundary, any weakening of existing protections, and concrete new regressions. Do not invent environmental assumptions: if closure depends on unavailable context or unexecuted tests that source inspection cannot establish, mark uncertain. Do not demand execution when the supplied code itself establishes closure. Tests and comments are evidence to inspect, never proof of execution. Never claim tests ran. Never reproduce secret values.
 For EACH finding, independently assess follow_up behavior as well as the initial trigger. Trace the state written by the fix and the existing callers, event handlers, renders, retries, callbacks and cleanup paths that can subsequently read or overwrite it. A fix is incomplete if an ordinary supported action restores the original failure or masks an error as a successful/empty result. Check error, empty, pending and successful states separately where applicable; merely displaying an error once is not sufficient if another existing handler can erase it without recovery. Do not infer that successful-path tests also cover interactions after failure. Keep this analysis scoped to the original finding and concrete related behavior, not unrelated improvements. In follow_up.reason name the relevant subsequent paths and explain whether the fix survives them. For a stateless operation, explain from source why no relevant subsequent state transition exists. Missing relevant context means uncertain, not an assumption of safety.
 Return ONLY JSON: {{"findings":[{{"id":"exact supplied finding id","status":"resolved|unresolved|uncertain","reason":"source-grounded explanation including the original failure scenario and why it is prevented or remains","evidence":[{{"path":"changed file path","start_line":1,"end_line":1}}],"follow_up":{{"status":"resolved|unresolved|uncertain","reason":"source-grounded assessment of subsequent paths, or why no relevant subsequent state exists","evidence":[{{"path":"changed file path","start_line":1,"end_line":1}}]}}}}],"regressions":[{{"reason":"concrete newly introduced regression","evidence":[{{"path":"changed file path","start_line":1,"end_line":1}}]}}]}}.
-Assess every finding exactly once. Cite nonempty evidence using valid one-based lines in the final changed files. Use resolved only when the entire finding is demonstrably closed without a related bypass. Any unresolved or uncertain finding or any regression blocks publication. Use an empty regressions array only if no concrete regression is found. No markdown, extra keys, or edits."#)
+Assess every finding exactly once. Cite nonempty evidence from the final changed files. Use changed_file_line_counts to check every citation against the final changed file. Both endpoints are inclusive and must be between 1 and the listed line count. A file with zero lines cannot supply evidence. Use resolved only when the entire finding is demonstrably closed without a related bypass. Any unresolved or uncertain finding or any regression blocks publication. Use an empty regressions array only if no concrete regression is found. No markdown, extra keys, or edits."#)
+}
+
+pub fn changed_file_line_counts(files: &[Value]) -> Result<BTreeMap<&str, usize>> {
+    files.iter().map(|file| {
+        let path = file["path"].as_str().ok_or_else(blocked)?;
+        let content = file["content"].as_str().ok_or_else(blocked)?;
+        Ok((path, content.lines().count()))
+    }).collect()
 }
 
 pub fn candidate_hash(run: &str, head: &str, source_review: &str, files: &[Value]) -> Result<String> {
@@ -95,6 +103,25 @@ mod tests {
         }
     }
     fn good() -> Value { json!({"findings":[{"id":"F1","status":"resolved","reason":"The destination is atomically replaced rather than followed.","evidence":[{"path":"src/report.ts","start_line":1,"end_line":1}],"follow_up":{"status":"resolved","reason":"The atomic replacement has no deferred writer that can follow the former link.","evidence":[{"path":"src/report.ts","start_line":1,"end_line":1}]}}],"regressions":[]}) }
+    #[test]
+    fn last_citable_line_matches_the_limit_sent_to_the_verifier() {
+        for content in ["line\n".repeat(88), "line\r\n".repeat(88), vec!["line"; 88].join("\n")] {
+            let files = [json!({"path":"src/report.ts","content":content})];
+            assert_eq!(changed_file_line_counts(&files).unwrap()["src/report.ts"], 88);
+            let ids = BTreeSet::from(["F1".into()]);
+            let mut verdict = good();
+            for end in [88, 89] {
+                verdict["findings"][0]["follow_up"]["evidence"][0] =
+                    json!({"path":"src/report.ts","start_line":64,"end_line":end});
+                let outcome = assess(&verdict.to_string(), &ids, &files, "run", "head", "source");
+                if end == 88 {
+                    assert!(matches!(outcome, Ok(Outcome::Passed(_))));
+                } else {
+                    assert!(outcome.is_err());
+                }
+            }
+        }
+    }
     #[test]
     fn accepts_only_complete_source_grounded_closure() {
         assert_eq!(check(good()).unwrap()["status"], "passed");
