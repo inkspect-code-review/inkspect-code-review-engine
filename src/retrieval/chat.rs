@@ -18,7 +18,7 @@ pub fn asks_for_lockfile(question: &str) -> bool {
         || ["lockfile", "lock file", "lock-file", "kilit dosya", "dependency resolution", "resolved dependencies"].iter().any(|word| q.contains(word))
 }
 
-fn implementation(path: &str) -> bool {
+pub(super) fn implementation(path: &str) -> bool {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "ts"|"tsx"|"js"|"jsx"|"mjs"|"cjs"|"py"|"go"|"rs"|"rb"|"java"|"kt"|"kts"|"swift"|"c"|"h"|"cpp"|"hpp"|"cs"|"php"|"gd"|"vue"|"svelte"|"sql"|"sh")
 }

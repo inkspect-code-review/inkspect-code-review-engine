@@ -11,6 +11,18 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-23
+
+#### Changed
+
+- Pace document embedding batches against a rolling token budget shared by worker jobs, and pause them on provider throttling.
+
+- Use a temporary review index to match changed code against PR documents and verified repository context in token-planned reviews.
+
+- Summarize large, newly added validation JSON results in token-planned reviews. Check candidate findings against the original diff before publishing.
+
+- Give the fix verifier the final line count of each changed file so it can cite valid evidence ranges.
+
 ### 2026-11-22
 
 #### Changed

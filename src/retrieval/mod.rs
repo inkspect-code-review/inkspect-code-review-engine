@@ -14,11 +14,13 @@
 //! that does not exist at the reviewed commit.
 
 pub mod cohere;
+mod embedding_rate;
 pub mod chat;
 pub mod hash;
 pub mod indexer;
 pub mod qdrant;
 pub mod review;
+pub mod pull;
 
 use crate::config::RetrievalConfig;
 use crate::domain::SourceRevision;

@@ -167,18 +167,27 @@ pub async fn run(
     }
 
     if host.token_planned_review {
-        let retrieved = match retrieve(host, job, &diff, &target, &repo_dir, &token, policy.as_ref()).await {
+        let (retrieved, scoped) = match retrieve(host, job, &diff, &target, &repo_dir, &token, policy.as_ref()).await {
             Ok(context) => context,
             Err(e) => {
                 crate::telemetry::record(serde_json::json!({"kind":"review.retrieval_failed"}))?;
-                if host.require_indexed_context { return Err(e); }
-                Vec::new()
+                if host.require_indexed_context || crate::retrieval::pull::mixed_review(&diff.files) { return Err(e); }
+                (Vec::new(), None)
             }
         };
-        crate::telemetry::record(serde_json::json!({"kind":"review.context","revision":job.head_sha,
-            "sources": retrieved.iter().map(|r| serde_json::json!({"path":r.path,"start_line":r.start_line,"end_line":r.end_line})).collect::<Vec<_>>() }))?;
+        let sources = scoped.as_ref().map(|c| c.source_ranges()).unwrap_or_else(|| retrieved.iter().map(|r|
+            serde_json::json!({"path":r.path,"start_line":r.start_line,"end_line":r.end_line})).collect());
+        crate::telemetry::record(serde_json::json!({"kind":"review.context","revision":job.head_sha,"sources":sources}))?;
         let model = ReviewModel::new(&host.model_region, &host.model_id, host.model_max_output_tokens).await?;
-        let report = crate::review_batches::run(&model, host, job, &snapshot.title, &snapshot.body, &diff, &retrieved, &target, &base).await?;
+        let contextual_documents = scoped.as_ref().map_or(0, |c| c.documents.len());
+        if let Some(c) = &scoped {
+            diff.files.retain(|f| !c.documents.contains(&f.path));
+            crate::telemetry::record(serde_json::json!({"kind":"review.pr_index","document_paths":contextual_documents,"primary_paths":diff.files.len()}))?;
+        }
+        let mut report = crate::review_batches::run_with_context(&model, host, job, &snapshot.title, &snapshot.body, &diff, &retrieved, &target, &base, scoped.as_ref()).await?;
+        if contextual_documents > 0 {
+            report.presentation_notes.push(format!("Code-focused review. {contextual_documents} documentation or validation file(s) were searched for supporting excerpts."));
+        }
         let mut report = review::with_exclusions(report, exclusions);
         report.run.review_notes = job.review_notes.clone();
         crate::render::attach(&mut report);
@@ -219,7 +228,7 @@ pub async fn run(
     let retrieved = match retrieve(&retrieval_host, job, &diff, &target, &repo_dir, &token, policy.as_ref())
         .await
     {
-        Ok(r) => r,
+        Ok((r, _)) => r,
         Err(e) => {
             crate::telemetry::record(serde_json::json!({"kind":"review.retrieval_failed"}))?;
             if host.require_indexed_context { return Err(e); }
@@ -332,11 +341,11 @@ async fn retrieve(
     repo_dir: &Path,
     token: &str,
     policy: Option<&IgnorePolicy>,
-) -> Result<Vec<crate::retrieval::Retrieved>> {
+) -> Result<(Vec<crate::retrieval::Retrieved>, Option<crate::retrieval::pull::Context>)> {
     let rc = &host.retrieval;
     if rc.content_bytes <= 2 || rc.max_files == 0 {
         if host.require_indexed_context { return Err(crate::error::err(Code::Retrieval, "retrieval is required")); }
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let bedrock = Bedrock::new(
         &rc.region,
@@ -353,9 +362,18 @@ async fn retrieve(
     // If no index exists and automatic review is enabled, index the repository
     // before retrieving so the first review on a repo still gets RAG context.
     let manifest = qdrant.manifest(&namespace, &schema)?;
+    if host.token_planned_review && !host.require_indexed_context {
+        let verifier = CloneVerifier { repo_dir, head_sha: &job.head_sha, token };
+        let pipeline = Retrieval { config: rc, schema: schema.clone(), embedder: &bedrock,
+            reranker: &bedrock, qdrant: &qdrant, verifier: &verifier, ignore: policy };
+        if let Some(context) = crate::retrieval::pull::retrieve(&pipeline,&bedrock,job,&diff.files,
+            manifest.as_ref(),&review_focus(job),host.index_max_input_bytes).await? {
+            return Ok((Vec::new(), Some(context)));
+        }
+    }
     let needs_index = manifest.as_ref().is_none_or(|m| host.require_indexed_context && m.revision.as_ref() != Some(target));
     if needs_index {
-        if job.auto_review {
+        if job.auto_review && (!host.token_planned_review || host.require_indexed_context) {
             tracing::info!("no index and auto-review enabled; indexing repository before review");
             let mut progress = crate::index_progress::IndexProgress::new();
             let indexed = crate::retrieval::indexer::index_repository(
@@ -377,7 +395,7 @@ async fn retrieve(
         } else {
             if host.require_indexed_context { return Err(crate::error::err(Code::Retrieval, "current repository index required")); }
             tracing::info!("no index and auto-review disabled; reviewing without RAG");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
     }
 
@@ -399,8 +417,9 @@ async fn retrieve(
         ignore: policy,
     };
     let focus = review_focus(job);
-    if host.require_indexed_context { pipeline.enrich_current(target, &focus, &diff.files) }
-    else { pipeline.enrich(target, &focus, &diff.files) }
+    let context = if host.require_indexed_context { pipeline.enrich_current(target, &focus, &diff.files) }
+    else { pipeline.enrich(target, &focus, &diff.files) }?;
+    Ok((context, None))
 }
 
 /// A short, bounded focus string built from (untrusted but length-limited)

@@ -118,3 +118,72 @@ async fn strict_retrieval_rejects_missing_and_stale_manifests_before_embedding()
         assert!(rank.calls.borrow().is_empty());server.join().unwrap();
     }
 }
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+#[ignore = "requires a disposable local Qdrant server via INKSPECT_TEST_QDRANT_URL"]
+async fn temporary_pr_vectors_match_both_sources_and_clean_up() {
+    use crate::git::LineEdit;
+    use crate::retrieval::pull::{retrieve, DocumentVectors};
+    struct Vectors;
+    impl DocumentVectors for Vectors {
+        async fn documents(&self, texts:&[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.,0.,0.];texts.len()])
+        }
+    }
+    impl Embedder for Vectors {
+        fn embed_query(&self,_:&str)->Result<Vec<f32>> {Ok(vec![1.,0.,0.])}
+    }
+    struct Ranking(bool);
+    impl Reranker for Ranking {
+        fn rerank(&self,_:&str,docs:&[String])->Result<Vec<(usize,f64)>> {
+            if self.0 {return Err(err(Code::Retrieval,"test failure after upsert"));}
+            Ok(docs.iter().enumerate().map(|(i,d)|(i,if d.contains("duration"){0.95}else{0.0})).collect())
+        }
+    }
+    let endpoint = std::env::var("INKSPECT_TEST_QDRANT_URL").unwrap();
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let db=Qdrant{endpoint,api_key:None,client:reqwest::Client::new()};
+    let schema=Schema::cohere(3);
+    let job:crate::config::ReviewJob=serde_json::from_str(include_str!("../../examples/job.example.json")).unwrap();
+    let ns=Namespace::for_revision(&job.target_revision());
+    let mut main=Chunk{path:"docs/runtime.md".into(),content:"duration contract".into(),start_line:1,end_line:1,key:String::new(),file_sha256:String::new()};
+    main.key=main.computed_key();
+    let snapshot="test-main";
+    db.ensure(&schema).await.unwrap();
+    db.upsert(&schema,vec![json!({"id":chunk_point_id(&ns,&schema,snapshot,&main.key),"vector":[1,0,0],"payload":{
+        "kind":"chunk","namespace":{"tenant":ns.tenant,"repository":ns.repository},"embedding_schema":{"version":1,"model":schema.model,"dimensions":3},
+        "snapshot":snapshot,"chunk":{"key":main.key,"path":main.path,"start_line":1,"end_line":1},"content":main.content}})]).await.unwrap();
+    let change=|path:&str,code:&str| ChangedFile{path:path.into(),base_path:String::new(),kind:"added".into(),unknown:false,
+        edits:vec![LineEdit{base_start:0,base_lines:0,target_start:1,target_lines:1}],excerpt:code.into(),hunk_text:format!("@@ -0,0 +1 @@\n+{code}\n")};
+    let files=[change("src/audio.rs","fn duration() {}"),change("docs/audio.md","duration specification"),change("docs/unrelated.md","gardening")];
+    let mut cfg=RetrievalConfig::default();
+    let verifier=Verify{chunks:vec![main]};
+    let manifest=Manifest{snapshot:snapshot.into(),revision:None};
+    let route=format!("/collections/{}_review",schema.collection());
+    db.ensure_at(&schema,&route).await.unwrap();
+    let foreign = "00000000-0000-4000-8000-000000000011";
+    let orphan = "00000000-0000-4000-8000-000000000012";
+    db.put(&format!("{route}/points?wait=true"), &json!({"points":[
+        {"id":foreign,"vector":[1,0,0],"payload":{"scope":"other-active-review","document":true,"expires":4102444800_i64}},
+        {"id":orphan,"vector":[1,0,0],"payload":{"scope":"aborted-review","document":true,"expires":1}}]})).await.unwrap();
+    for (failure,queries) in [(false,1),(true,1),(false,0)] {
+        cfg.queries=queries;
+        let rank=Ranking(failure);
+        let p=Pipeline{config:&cfg,schema:schema.clone(),embedder:&Vectors,reranker:&rank,qdrant:&db,verifier:&verifier,ignore:None};
+        let result=retrieve(&p,&Vectors,&job,&files,Some(&manifest),"test",0).await;
+        if failure {assert!(result.is_err());} else {
+            let context=result.unwrap().unwrap();
+            assert_eq!(context.documents.len(),2);
+            let selected=context.select(&files[..1]);
+            assert!(selected.len()>=2);
+            assert!(selected.iter().any(|v|v["path"]=="docs/audio.md" && v["source"]=="pull_request_diff"));
+            assert!(selected.iter().any(|v|v["path"]=="docs/runtime.md" && v["source"]=="repository_head"));
+            assert!(context.select(&files[1..]).is_empty());
+        }
+        let count=db.post(&format!("{route}/points/count"),&json!({"exact":true})).await.unwrap();
+        assert_eq!(count["count"],1);
+        let remaining=db.post(&format!("{route}/points"),&json!({"ids":[foreign],"with_payload":true})).await.unwrap();
+        assert_eq!(remaining[0]["payload"]["scope"],"other-active-review");
+        assert_eq!(db.query(&ns,&schema,snapshot,&[1.,0.,0.],4).unwrap().len(),1);
+    }
+}

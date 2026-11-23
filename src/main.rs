@@ -37,6 +37,7 @@ mod index_progress;
 mod model;
 mod pipeline;
 mod review_batches;
+mod validation_json;
 mod prompts;
 mod provider_usage;
 mod render;
