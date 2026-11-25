@@ -22,6 +22,7 @@ pub struct IndexProgress {
     pub scan: Scan,
     pub chunks: usize,
     pub embedded: usize,
+    pub reused: usize,
     pub indexed: bool,
     logs: Vec<Log>,
     #[serde(skip)]
@@ -49,7 +50,7 @@ impl IndexProgress {
     }
 
     pub fn embedding(&mut self) {
-        self.log("embedding", format!("Indexing chunks: {}/{} saved.", self.embedded, self.chunks));
+        self.log("embedding", format!("Indexing chunks: {}/{} saved.", self.embedded + self.reused, self.chunks));
         self.publish(true);
     }
 

@@ -11,6 +11,16 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-25
+
+#### Changed
+
+- Build repository snapshots incrementally from the pinned Git tree. Unchanged chunks share existing vectors, and searches and source citations use only the chunks in the selected snapshot.
+
+#### Fixed
+
+- Resume indexing from persisted chunks and retain prior snapshots for verified review context. Optional retrieval failures allow review of the pinned diff.
+
 ### 2026-11-23
 
 #### Changed

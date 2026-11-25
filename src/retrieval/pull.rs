@@ -28,13 +28,6 @@ fn documentation(path: &str) -> bool {
         || path.ends_with(".json") && path.starts_with("docs/validation/")
 }
 
-pub fn mixed_review(files: &[ChangedFile]) -> bool {
-    files
-        .iter()
-        .any(|f| !f.unknown && chat::implementation(&f.path))
-        && files.iter().any(|f| documentation(&f.path))
-}
-
 struct Match {
     path: String,
     edit: LineEdit,
@@ -346,7 +339,7 @@ async fn match_parts(
             for (c, score) in p.qdrant.query_inner(
                 ns,
                 &p.schema,
-                &main.snapshot,
+                main,
                 &vector,
                 p.config.candidates.min(12),
                 true,

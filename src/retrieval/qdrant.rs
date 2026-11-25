@@ -1,11 +1,9 @@
-//! Minimal Qdrant REST client, read-only against the shared repository index.
-//!
-//! Endpoint and api-key come from the environment (INKSPECT_QDRANT_URL,
-//! INKSPECT_QDRANT_API_KEY), never from a job. Only the two reads the review
-//! path needs are implemented: manifest lookup and vector search. Writes are
-//! owned by the Go repository-index worker.
+//! Qdrant storage for immutable repository chunks and published snapshot manifests.
+//! Both legacy single-snapshot indexes and incremental manifests are readable.
+//! Connection credentials come from the worker environment.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::hash::GoJson;
 use super::{chunk_point_id, Chunk, Namespace, Schema};
@@ -18,10 +16,44 @@ const MANIFEST_PREFIX: &str = "manifest";
 mod review_pipeline_tests;
 
 /// Resolved manifest describing the current index snapshot for a repository.
+#[derive(Default)]
 pub struct Manifest {
     pub snapshot: String,
     pub revision: Option<crate::domain::SourceRevision>,
+    /// Absent on older indexes, whose points all share the same snapshot ID.
+    pub files: Option<SnapshotFiles>,
 }
+
+pub type SnapshotFiles = BTreeMap<String, IndexedFile>;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct IndexedFile {
+    pub blob: String,
+    pub text: bool,
+    pub input_bytes: usize,
+    /// Content/location key -> immutable Qdrant point, possibly from an earlier commit.
+    pub points: BTreeMap<String, String>,
+}
+
+impl Manifest {
+    fn membership_filter(&self, path: Option<&str>) -> serde_json::Value {
+        match &self.files {
+            None => serde_json::json!({"key":"snapshot","match":{"value":self.snapshot}}),
+            Some(files) => {
+                let ids: Vec<_> = files.iter().filter(|(p, _)| path.is_none_or(|wanted| wanted == p.as_str()))
+                    .flat_map(|(_, file)| file.points.values()).collect();
+                serde_json::json!({"has_id":ids})
+            }
+        }
+    }
+
+    fn contains(&self, path: &str, key: &str, id: &str) -> bool {
+        self.files.as_ref().is_none_or(|files| {
+            files.get(path).and_then(|f| f.points.get(key)).is_some_and(|expected| expected == id)
+        })
+    }
+}
+
 
 pub struct Qdrant {
     endpoint: String,
@@ -129,6 +161,8 @@ impl Qdrant {
         }
         Ok(Some(Manifest {
             snapshot: snapshot.to_string(),
+            files: point.payload.get("files_v1").cloned().map(serde_json::from_value).transpose()
+                .map_err(|_| err(Code::Retrieval, "invalid snapshot file map"))?,
             revision: point.payload.get("revision").cloned().map(serde_json::from_value).transpose()
                 .map_err(|_| err(Code::Retrieval, "invalid manifest revision"))?,
         }))
@@ -140,26 +174,29 @@ impl Qdrant {
         &self,
         ns: &Namespace,
         schema: &Schema,
-        snapshot: &str,
+        manifest: &Manifest,
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<Chunk>> {
-        Ok(self.query_inner(ns, schema, snapshot, vector, limit, false)?.into_iter().map(|(chunk, _)| chunk).collect())
+        Ok(self.query_inner(ns, schema, manifest, vector, limit, false)?.into_iter().map(|(chunk, _)| chunk).collect())
     }
 
     /// Inspection samples files, so a long generated file cannot occupy the
     /// entire candidate budget. Uses the existing payload; no re-index needed.
     pub fn query_files(
-        &self, ns: &Namespace, schema: &Schema, snapshot: &str,
+        &self, ns: &Namespace, schema: &Schema, manifest: &Manifest,
         vector: &[f32], limit: usize,
     ) -> Result<Vec<Chunk>> {
-        Ok(self.query_inner(ns, schema, snapshot, vector, limit, true)?.into_iter().map(|(chunk, _)| chunk).collect())
+        Ok(self.query_inner(ns, schema, manifest, vector, limit, true)?.into_iter().map(|(chunk, _)| chunk).collect())
     }
 
     pub(super) fn query_inner(
-        &self, ns: &Namespace, schema: &Schema, snapshot: &str,
+        &self, ns: &Namespace, schema: &Schema, manifest: &Manifest,
         vector: &[f32], limit: usize, grouped: bool,
     ) -> Result<Vec<(Chunk, f64)>> {
+        if manifest.files.as_ref().is_some_and(|files| files.values().all(|f| f.points.is_empty())) {
+            return Ok(Vec::new());
+        }
         let filter = serde_json::json!({
             "must": [
                 {"key": "kind", "match": {"value": "chunk"}},
@@ -168,7 +205,7 @@ impl Qdrant {
                 {"key": "embedding_schema.model", "match": {"value": schema.model}},
                 {"key": "embedding_schema.version", "match": {"value": schema.version}},
                 {"key": "embedding_schema.dimensions", "match": {"value": schema.dimensions}},
-                {"key": "snapshot", "match": {"value": snapshot}},
+                manifest.membership_filter(None),
             ]
         });
         let route = format!("{}/points/query{}", self.collection_route(schema), if grouped { "/groups" } else { "" });
@@ -219,8 +256,9 @@ impl Qdrant {
                 content,
             };
             // Validate the id matches the Go-derived chunk point id.
-            let expected = chunk_point_id(ns, schema, snapshot, &chunk.key);
-            if p.id != expected {
+            let origin = if manifest.files.is_some() { field_str(&payload, "snapshot")? } else { manifest.snapshot.clone() };
+            let expected = chunk_point_id(ns, schema, &origin, &chunk.key);
+            if p.id != expected || !manifest.contains(&chunk.path, &chunk.key, &p.id) {
                 return Err(err(Code::Retrieval, "chunk point id mismatch"));
             }
             chunks.push((chunk, p.score));
@@ -229,7 +267,10 @@ impl Qdrant {
     }
 
     /// Read an exact cited chunk from the saved snapshot without GitHub.
-    pub fn source(&self, ns: &Namespace, schema: &Schema, snapshot: &str, path: &str, start: u32, end: u32) -> Result<Option<String>> {
+    pub fn source(&self, ns: &Namespace, schema: &Schema, manifest: &Manifest, path: &str, start: u32, end: u32) -> Result<Option<String>> {
+        if manifest.files.as_ref().is_some_and(|files| files.get(path).is_none_or(|f| f.points.is_empty())) {
+            return Ok(None);
+        }
         let route = format!("{}/points/scroll", self.collection_route(schema));
         let body = serde_json::json!({"limit": 1, "with_payload": true, "with_vector": false,
             "filter": {"must": [
@@ -239,7 +280,7 @@ impl Qdrant {
                 {"key":"embedding_schema.model","match":{"value":schema.model}},
                 {"key":"embedding_schema.version","match":{"value":schema.version}},
                 {"key":"embedding_schema.dimensions","match":{"value":schema.dimensions}},
-                {"key":"snapshot","match":{"value":snapshot}},
+                manifest.membership_filter(Some(path)),
                 {"key":"chunk.path","match":{"value":path}},
                 {"key":"chunk.start_line","match":{"value":start}},
                 {"key":"chunk.end_line","match":{"value":end}}
@@ -251,9 +292,10 @@ impl Qdrant {
         let Some(point) = result.points.into_iter().next() else { return Ok(None); };
         let chunk = Chunk {key:field_str(&point.payload["chunk"],"key")?,path:path.into(),start_line:start,end_line:end,
             file_sha256:String::new(),content:field_str(&point.payload,"content")?};
-        if point.payload["kind"] != "chunk" || point.payload["chunk"]["path"] != path
+        let origin = if manifest.files.is_some() { field_str(&point.payload, "snapshot")? } else { manifest.snapshot.clone() };
+        if !manifest.contains(path, &chunk.key, &point.id) || point.payload["kind"] != "chunk" || point.payload["chunk"]["path"] != path
             || point.payload["chunk"]["start_line"] != start || point.payload["chunk"]["end_line"] != end
-            || chunk.key != chunk.computed_key() || point.id != chunk_point_id(ns,schema,snapshot,&chunk.key) {
+            || chunk.key != chunk.computed_key() || point.id != chunk_point_id(ns,schema,&origin,&chunk.key) {
             return Err(err(Code::Retrieval, "saved source integrity failed"));
         }
         Ok(Some(chunk.content))
@@ -261,10 +303,6 @@ impl Qdrant {
 
     // ---- Write path (repository indexing) --------------------------------
     //
-    // These mirror the Go engine's Ensure / upsert / cleanup so the index the
-    // Rust engine writes is byte-for-byte acceptable to the Go read path (and
-    // to this engine's own reader above).
-
     pub(super) async fn put(&self, route: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let mut req = self
             .client
@@ -370,34 +408,34 @@ impl Qdrant {
         Ok(())
     }
 
-    /// Delete chunk points of every snapshot except the current one, matching
-    /// the Go cleanup filter (must = scope minus snapshot, must_not = snapshot).
-    pub async fn delete_old_snapshots(
-        &self,
-        ns: &Namespace,
-        schema: &Schema,
-        snapshot: &str,
-    ) -> Result<()> {
-        let filter = serde_json::json!({
-            "must": [
-                {"key": "kind", "match": {"value": "chunk"}},
-                {"key": "namespace.tenant", "match": {"value": ns.tenant}},
-                {"key": "namespace.repository", "match": {"value": ns.repository}},
-                {"key": "embedding_schema.model", "match": {"value": schema.model}},
-                {"key": "embedding_schema.version", "match": {"value": schema.version}},
-                {"key": "embedding_schema.dimensions", "match": {"value": schema.dimensions}},
-            ],
-            "must_not": [
-                {"key": "snapshot", "match": {"value": snapshot}}
-            ],
-        });
-        let route = format!("{}/points/delete?wait=true", self.collection_route(schema));
-        let body = serde_json::json!({ "filter": filter });
-        let result = self.post(&route, &body).await?;
-        if result.get("status").and_then(|v| v.as_str()) != Some("completed") {
-            return Err(err(Code::Retrieval, "qdrant delete incomplete"));
+    /// Point IDs bind the tenant, repository, schema, revision snapshot and chunk key.
+    pub async fn saved_chunk_ids(&self, schema: &Schema, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+        let route = format!("{}/points", self.collection_route(schema));
+        let mut saved = std::collections::HashSet::new();
+        for batch in ids.chunks(256) {
+            let result = self.post(&route, &serde_json::json!({
+                "ids": batch, "with_payload": false, "with_vector": false
+            })).await?;
+            let points = result.as_array().ok_or_else(|| err(Code::Retrieval, "invalid checkpoint response"))?;
+            for point in points {
+                let id = field_str(point, "id")?;
+                if !batch.contains(&id) { return Err(err(Code::Retrieval, "unexpected checkpoint point")); }
+                saved.insert(id);
+            }
         }
-        Ok(())
+        Ok(saved)
+    }
+
+    /// Preserve the previous complete manifest before replacing the active pointer.
+    pub async fn archive_previous(&self, ns: &Namespace, schema: &Schema, previous: &Manifest, next: &str) -> Result<()> {
+        if previous.snapshot == next { return Ok(()); }
+        let id = super::hash::point_id(&GoJson::Array(vec![GoJson::s("stale-manifest"),
+            ns.go_json(), schema.go_json(), GoJson::s(&previous.snapshot)]));
+        self.upsert(schema, vec![serde_json::json!({
+            "id": id, "vector": vec![0.0f32; schema.dimensions as usize],
+            "payload": { "kind": "snapshot_manifest", "freshness": "stale", "snapshot": previous.snapshot,
+                "revision": previous.revision, "files_v1": previous.files, "namespace": {"tenant": ns.tenant, "repository": ns.repository} }
+        })]).await
     }
 
     /// The manifest point id, matching Go `pointID(["manifest", ns, schema])`.
@@ -523,7 +561,7 @@ mod group_tests {
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}",response.len(),response).unwrap();
         });
         let client=Qdrant{endpoint,api_key:None,client:reqwest::Client::new()};
-        let result=client.query_files(&ns,&schema,"snapshot",&[0.1,0.2],40).unwrap();
+        let result=client.query_files(&ns,&schema,&Manifest {snapshot:"snapshot".into(), ..Default::default()},&[0.1,0.2],40).unwrap();
         assert_eq!(result.len(),1);assert_eq!(result[0].path,"src/main.ts");
         server.join().unwrap();
     }
@@ -579,10 +617,10 @@ mod group_tests {
             }
         });
         let client = Qdrant { endpoint, api_key:None, client:reqwest::Client::new() };
-        assert_eq!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).unwrap(),Some(chunk.content));
-        assert!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).is_err());
-        assert!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).is_err());
-        assert!(client.source(&ns,&schema,"snapshot","src/a.ts",10,11).unwrap().is_none());
+        assert_eq!(client.source(&ns,&schema,&Manifest {snapshot:"snapshot".into(), ..Default::default()},"src/a.ts",10,11).unwrap(),Some(chunk.content));
+        assert!(client.source(&ns,&schema,&Manifest {snapshot:"snapshot".into(), ..Default::default()},"src/a.ts",10,11).is_err());
+        assert!(client.source(&ns,&schema,&Manifest {snapshot:"snapshot".into(), ..Default::default()},"src/a.ts",10,11).is_err());
+        assert!(client.source(&ns,&schema,&Manifest {snapshot:"snapshot".into(), ..Default::default()},"src/a.ts",10,11).unwrap().is_none());
         server.join().unwrap();
     }
 }

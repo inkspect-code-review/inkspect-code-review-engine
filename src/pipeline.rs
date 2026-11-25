@@ -171,7 +171,7 @@ pub async fn run(
             Ok(context) => context,
             Err(e) => {
                 crate::telemetry::record(serde_json::json!({"kind":"review.retrieval_failed"}))?;
-                if host.require_indexed_context || crate::retrieval::pull::mixed_review(&diff.files) { return Err(e); }
+                if host.require_indexed_context { return Err(e); }
                 (Vec::new(), None)
             }
         };
@@ -363,6 +363,11 @@ async fn retrieve(
     // before retrieving so the first review on a repo still gets RAG context.
     let manifest = qdrant.manifest(&namespace, &schema)?;
     if host.token_planned_review && !host.require_indexed_context {
+        if let Some(m) = &manifest {
+            crate::telemetry::record(serde_json::json!({"kind":"review.index",
+                "revision":m.revision.as_ref().map(|r| &r.revision_id),
+                "stale":m.revision.as_ref() != Some(target), "reused":true}))?;
+        }
         let verifier = CloneVerifier { repo_dir, head_sha: &job.head_sha, token };
         let pipeline = Retrieval { config: rc, schema: schema.clone(), embedder: &bedrock,
             reranker: &bedrock, qdrant: &qdrant, verifier: &verifier, ignore: policy };

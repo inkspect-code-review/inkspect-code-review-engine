@@ -251,12 +251,12 @@ impl<'a> Pipeline<'a> {
             let mut points = self.qdrant.query_files(
                 &namespace,
                 &self.schema,
-                &manifest.snapshot,
+                &manifest,
                 &vector,
                 self.config.candidates,
             )?;
             points.extend(self.qdrant.query(
-                &namespace, &self.schema, &manifest.snapshot, &vector, self.config.candidates,
+                &namespace, &self.schema, &manifest, &vector, self.config.candidates,
             )?);
             let mut seen = std::collections::HashSet::new();
 

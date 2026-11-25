@@ -158,7 +158,7 @@ async fn temporary_pr_vectors_match_both_sources_and_clean_up() {
     let files=[change("src/audio.rs","fn duration() {}"),change("docs/audio.md","duration specification"),change("docs/unrelated.md","gardening")];
     let mut cfg=RetrievalConfig::default();
     let verifier=Verify{chunks:vec![main]};
-    let manifest=Manifest{snapshot:snapshot.into(),revision:None};
+    let manifest=Manifest{snapshot:snapshot.into(),revision:None,files:None};
     let route=format!("/collections/{}_review",schema.collection());
     db.ensure_at(&schema,&route).await.unwrap();
     let foreign = "00000000-0000-4000-8000-000000000011";
@@ -184,6 +184,162 @@ async fn temporary_pr_vectors_match_both_sources_and_clean_up() {
         assert_eq!(count["count"],1);
         let remaining=db.post(&format!("{route}/points"),&json!({"ids":[foreign],"with_payload":true})).await.unwrap();
         assert_eq!(remaining[0]["payload"]["scope"],"other-active-review");
-        assert_eq!(db.query(&ns,&schema,snapshot,&[1.,0.,0.],4).unwrap().len(),1);
+        assert_eq!(db.query(&ns,&schema,&manifest,&[1.,0.,0.],4).unwrap().len(),1);
     }
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+#[ignore = "requires a disposable local Qdrant server via INKSPECT_TEST_QDRANT_URL"]
+async fn interrupted_index_reuses_durable_chunks_and_keeps_the_last_complete_snapshot() {
+    use crate::index_progress::IndexProgress;
+    use crate::retrieval::{indexer::persist_chunks, pull::DocumentVectors};
+    struct Vectors { calls: std::cell::Cell<usize>, fail_second: bool }
+    impl DocumentVectors for Vectors {
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail_second && self.calls.get() == 2 { return Err(err(Code::Retrieval, "interrupted")); }
+            Ok(vec![vec![1.,0.,0.];texts.len()])
+        }
+    }
+    let endpoint = std::env::var("INKSPECT_TEST_QDRANT_URL").unwrap();
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let db = Qdrant { endpoint, api_key: None, client: reqwest::Client::new() };
+    let schema = Schema::cohere(3);
+    let mut rev = SourceRevision { tenant_id: format!("resume-test-{}", rand::random::<u64>()), provider: "github".into(),
+        provider_instance: "github.com".into(), repository_id: "1".into(), revision_id: "old".into() };
+    let ns = Namespace::for_revision(&rev);
+    let chunks: Vec<_> = (0..40).map(|i| {
+        let mut chunk = Chunk { key: String::new(), path:format!("file{i}.rs"), start_line:1,end_line:1,
+            file_sha256:String::new(), content:"let value = 1;".into() };
+        chunk.key = chunk.computed_key(); chunk
+    }).collect();
+    let good = Vectors { calls: 0.into(), fail_second: false };
+    let mut prior = chunks[0].clone();
+    prior.content = "previous content".into(); prior.key = prior.computed_key();
+    persist_chunks(&[prior.clone()], &rev, &schema, &good, &db, &mut IndexProgress::default()).await.unwrap();
+    let old = db.manifest(&ns, &schema).unwrap().unwrap();
+    rev.revision_id = "new".into();
+    let interrupted = Vectors { calls:0.into(), fail_second:true };
+    assert!(persist_chunks(&chunks, &rev, &schema, &interrupted, &db, &mut IndexProgress::default()).await.is_err());
+    assert_eq!(db.manifest(&ns, &schema).unwrap().unwrap().snapshot,old.snapshot);
+    let archived = db.post(&format!("{}/points/scroll", db.collection_route(&schema)), &json!({
+        "filter":{"must":[
+            {"key":"namespace.tenant","match":{"value":ns.tenant}},
+            {"key":"kind","match":{"value":"snapshot_manifest"}},
+            {"key":"snapshot","match":{"value":old.snapshot}}
+        ]}, "with_payload":true, "with_vector":false
+    })).await.unwrap();
+    assert_eq!(archived["points"].as_array().unwrap().len(), 1);
+    assert_eq!(archived["points"][0]["payload"]["freshness"], "stale");
+    let mut resumed = IndexProgress::default();
+    persist_chunks(&chunks, &rev, &schema, &good, &db, &mut resumed).await.unwrap();
+    assert_eq!((resumed.reused,resumed.embedded),(32,8));
+    assert_eq!(db.manifest(&ns,&schema).unwrap().unwrap().revision.unwrap(),rev);
+    let old_chunk = chunk_point_id(&ns,&schema,&old.snapshot,&prior.key);
+    assert!(db.saved_chunk_ids(&schema,&[old_chunk.clone()]).await.unwrap().contains(&old_chunk));
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+#[ignore = "requires a disposable local Qdrant server via INKSPECT_TEST_QDRANT_URL"]
+async fn merged_tree_reuses_only_current_chunks_and_preserves_previous_sources() {
+    use crate::{ignore::IgnorePolicy, index_progress::IndexProgress};
+    use crate::retrieval::{indexer::index_repository, pull::DocumentVectors};
+    use std::{cell::RefCell, path::Path, process::{Command, Stdio}};
+
+    // Build immutable trees in a disposable bare object store. No branches or commits are needed.
+    fn git(dir: &Path, args: &[&str], input: &str) -> String {
+        let mut child = Command::new("git").arg("-C").arg(dir).args(args)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().into()
+    }
+    fn tree(dir: &Path, entries: &[(&str, &str)]) -> String {
+        let mut listing = String::new();
+        for (path, text) in entries {
+            let id = git(dir, &["hash-object", "-w", "--stdin"], text);
+            listing.push_str(&format!("100644 blob {id}\t{path}\n"));
+        }
+        git(dir, &["mktree"], &listing)
+    }
+    struct Vectors(RefCell<Vec<String>>);
+    impl DocumentVectors for Vectors {
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.0.borrow_mut().extend_from_slice(texts);
+            Ok(vec![vec![1.,0.,0.]; texts.len()])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--bare", "--quiet"], "");
+    let first = tree(dir.path(), &[("keep.rs","keep"), ("edited.rs","old"),
+        ("deleted.rs","gone"),("nowignored.rs","excluded"),("before.rs","moved")]);
+    let next = tree(dir.path(), &[("keep.rs","keep"), ("edited.rs","new"),
+        ("nowignored.rs","excluded"),("after.rs","moved")]);
+    let endpoint = std::env::var("INKSPECT_TEST_QDRANT_URL").unwrap();
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let db = Qdrant { endpoint, api_key:None, client:reqwest::Client::new() };
+    let schema = Schema::cohere(3);
+    let mut rev = SourceRevision { tenant_id:format!("delta-{}",rand::random::<u64>()),provider:"github".into(),
+        provider_instance:"github.com".into(),repository_id:"1".into(),revision_id:first.clone() };
+    let ns = Namespace::for_revision(&rev);
+    let embed = Vectors(RefCell::new(Vec::new()));
+    index_repository(dir.path(),&first,&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),0).await.unwrap();
+    let before = db.manifest(&ns,&schema).unwrap().unwrap();
+    assert_eq!(embed.0.borrow().len(),5);
+    // Older releases stored just a revision and snapshot. Their vectors must
+    // remain reusable on the first incremental refresh after upgrading.
+    let route = format!("{}/points", db.collection_route(&schema));
+    let active_id = Qdrant::manifest_id(&ns,&schema);
+    let raw = db.post(&route, &json!({"ids":[active_id],"with_payload":true,"with_vector":true})).await.unwrap();
+    let mut legacy = raw[0].clone();
+    legacy["payload"].as_object_mut().unwrap().remove("files_v1");
+    db.upsert(&schema, vec![legacy]).await.unwrap();
+    assert!(db.manifest(&ns,&schema).unwrap().unwrap().files.is_none());
+    embed.0.borrow_mut().clear();
+    rev.revision_id = next.clone();
+    let ignore = IgnorePolicy::parse(b"nowignored.rs\n").unwrap();
+    let mut progress = IndexProgress::default();
+    index_repository(dir.path(),&next,&rev,&schema,&embed,&db,"",Some(&ignore),&mut progress,0).await.unwrap();
+    assert_eq!((progress.chunks,progress.reused,progress.embedded),(3,1,2));
+    let after=db.manifest(&ns,&schema).unwrap().unwrap();
+    assert_eq!(before.files.as_ref().unwrap()["keep.rs"].points,after.files.as_ref().unwrap()["keep.rs"].points);
+    for grouped in [false,true] {
+        let found=db.query_inner(&ns,&schema,&after,&[1.,0.,0.],20,grouped).unwrap();
+        let mut actual:Vec<_>=found.into_iter().map(|(c,_)|(c.path,c.content)).collect();
+        actual.sort();
+        assert_eq!(actual,vec![("after.rs".into(),"moved".into()),("edited.rs".into(),"new".into()),("keep.rs".into(),"keep".into())]);
+    }
+    assert_eq!(db.source(&ns,&schema,&before,"edited.rs",1,1).unwrap().as_deref(),Some("old"));
+    assert_eq!(db.source(&ns,&schema,&after,"edited.rs",1,1).unwrap().as_deref(),Some("new"));
+    assert!(db.source(&ns,&schema,&after,"deleted.rs",1,1).unwrap().is_none());
+    // A later revision with identical blobs reads the same immutable points.
+    let mut repeated = IndexProgress::default();
+    index_repository(dir.path(),&next,&rev,&schema,&embed,&db,"",Some(&ignore),&mut repeated,0).await.unwrap();
+    assert_eq!((repeated.reused,repeated.embedded),(3,0));
+    assert_eq!(embed.0.borrow().len(),2);
+
+    let old_text = "line\n".repeat(160);
+    let new_text = format!("{}replacement\n", "line\n".repeat(159));
+    let text_a = tree(dir.path(), &[("long.rs",&old_text)]);
+    let text_b = tree(dir.path(), &[("long.rs",&new_text)]);
+    for (id, expected) in [(&text_a, (0,3)), (&text_b, (2,1))] {
+        rev.revision_id = id.clone();
+        let mut update = IndexProgress::default();
+        index_repository(dir.path(),id,&rev,&schema,&embed,&db,"",None,&mut update,0).await.unwrap();
+        assert_eq!((update.reused,update.embedded),expected);
+    }
+    // A missing object during a refresh must never publish a partial tree.
+    let broken = tree(dir.path(), &[("missing.rs","unavailable")]);
+    let blob = git(dir.path(), &["hash-object","--stdin"], "unavailable");
+    std::fs::remove_file(dir.path().join("objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+    rev.revision_id = broken.clone();
+    assert!(index_repository(dir.path(),&broken,&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),0).await.is_err());
+    assert_eq!(db.manifest(&ns,&schema).unwrap().unwrap().revision.unwrap().revision_id,text_b);
+
+    let empty = tree(dir.path(), &[]);
+    rev.revision_id = empty.clone();
+    index_repository(dir.path(),&empty,&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),0).await.unwrap();
+    let active = db.manifest(&ns,&schema).unwrap().unwrap();
+    assert!(db.query(&ns,&schema,&active,&[1.,0.,0.],10).unwrap().is_empty());
 }

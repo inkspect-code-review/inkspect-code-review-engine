@@ -9,19 +9,18 @@
 //! Flow:
 //!   1. Walk the pinned head tree in the prepared clone, select eligible text
 //!      files, and window them into chunks (80 lines / 2400 bytes, 8 overlap).
-//!   2. Embed chunk inputs as documents (Cohere Embed v4, L2-normalized).
+//!   2. Reuse unchanged blobs and verified chunk identities. Embed new chunk inputs.
 //!   3. Upsert chunk points, then the manifest point LAST so a reader never
 //!      sees a snapshot whose chunks are incomplete.
-//!   4. Delete chunk points from older snapshots.
+//!   4. Retain prior complete snapshots for verified fallback.
 //!
 //! The snapshot id is simply derived from the indexed commit and schema; it is
 //! opaque to readers (they take it from the manifest).
 
 use std::path::Path;
 
-use super::cohere::Bedrock;
 use super::hash::{digest, digest_string, GoJson};
-use super::qdrant::Qdrant;
+use super::qdrant::{IndexedFile, Manifest, Qdrant, SnapshotFiles};
 use super::{chunk_point_id, Chunk, Namespace, Schema};
 use crate::domain::SourceRevision;
 use crate::error::{err, Code, Result};
@@ -44,41 +43,107 @@ pub async fn index_repository(
     head_sha: &str,
     rev: &SourceRevision,
     schema: &Schema,
-    embedder: &Bedrock,
+    embedder: &impl super::pull::DocumentVectors,
     qdrant: &Qdrant,
     token: &str,
     ignore: Option<&IgnorePolicy>,
     progress: &mut IndexProgress,
     max_input_bytes: usize,
 ) -> Result<usize> {
+
+    let ns = Namespace::for_revision(rev);
+    qdrant.ensure(schema).await?;
+    let previous = qdrant.manifest(&ns, schema)?;
+    let previous_files = previous.as_ref().and_then(|m| m.files.as_ref());
+    let tree = list_blobs(repo_dir, head_sha, token).await?;
+    let mut files = SnapshotFiles::new();
+    let mut changed = Vec::new();
+    progress.scan = Scan { measured: true, stage: "reading".into(), total: tree.len(), ..Scan::default() };
+    progress.stage("reading", "Checking files against the previous index.".into());
+    for (path, blob) in tree {
+        progress.scan.processed += 1;
+        let mut count = 0;
+        if eligible(&path) && !ignore.is_some_and(|policy| policy.excluded(&path)) {
+            if let Some(cached) = previous_files.and_then(|fs| fs.get(&path)).filter(|f| f.blob == blob) {
+                count = cached.points.len();
+                progress.reused += count;
+                progress.scan.read += usize::from(cached.text);
+                files.insert(path, cached.clone());
+            } else {
+                // A fetch error must leave the previous complete manifest active.
+                // Only cache an exclusion after successfully examining this object.
+                let content = read_pinned_blob(repo_dir, &blob, token).await?;
+                let mut file = IndexedFile { blob, text: content.is_some(), ..Default::default() };
+                if let Some(content) = content {
+                    let chunks = chunk_file(&path, &content);
+                    count = chunks.len();
+                    file.input_bytes = chunks.iter().map(|c| c.input().len()).sum();
+                    progress.scan.read += 1;
+                    changed.extend(chunks);
+                }
+                files.insert(path, file);
+            }
+        }
+        if count == 0 { progress.scan.skipped += 1; }
+        progress.chunks += count;
+        if progress.chunks > MAX_CHUNKS { return Err(err(Code::Retrieval, "repository exceeds chunk limit")); }
+        progress.reading(false);
+    }
+    progress.scan.stage = "completed".into();
+    progress.reading(true);
+    check_input_budget(files.values().map(|file| file.input_bytes).sum(), max_input_bytes)?;
+    persist_changes(&changed, files, previous.as_ref(), rev, schema, embedder, qdrant, progress).await?;
+    Ok(progress.chunks)
+}
+
+async fn persist_changes(chunks: &[Chunk], mut files: SnapshotFiles, previous: Option<&Manifest>,
+    rev: &SourceRevision, schema: &Schema, embedder: &impl super::pull::DocumentVectors,
+    qdrant: &Qdrant, progress: &mut IndexProgress) -> Result<()> {
     let namespace = Namespace::for_revision(rev);
     let snapshot = snapshot_id(rev, schema);
+    let total = progress.chunks;
+    progress.stage("embedding", format!("Indexing changed chunks for {total} repository chunks."));
+    if let Some(m) = previous { qdrant.archive_previous(&namespace, schema, m, &snapshot).await?; }
 
-    let chunks = scan_repository(repo_dir, head_sha, token, ignore, progress).await?;
-    check_input_budget(&chunks, max_input_bytes)?;
-    tracing::info!(chunks = chunks.len(), "indexing repository");
-
-    progress.stage("embedding", format!("Indexing chunks: 0/{} saved.", chunks.len()));
-    qdrant.ensure(schema).await?;
-
-    // 2 + 3. Embed in batches and upsert chunk points.
-    let total = chunks.len();
+    // A legacy manifest has one physical snapshot. Newer manifests may reference
+    // immutable points from multiple commits. The target revision can also have
+    // already persisted points from an interrupted run.
+    let mut candidates = Vec::with_capacity(chunks.len() * 2);
+    let ids: Vec<_> = chunks.iter().map(|chunk| {
+        let target = chunk_point_id(&namespace, schema, &snapshot, &chunk.key);
+        let prior = previous.and_then(|m| match &m.files {
+            Some(fs) => fs.get(&chunk.path)?.points.get(&chunk.key).cloned(),
+            None => Some(chunk_point_id(&namespace, schema, &m.snapshot, &chunk.key)),
+        });
+        candidates.push(target.clone());
+        if let Some(id) = &prior { if id != &target { candidates.push(id.clone()); } }
+        (target, prior)
+    }).collect();
+    let saved = qdrant.saved_chunk_ids(schema, &candidates).await?;
+    let mut pending = Vec::new();
+    for (chunk, (target, prior)) in chunks.iter().zip(ids) {
+        let point = prior.filter(|id| saved.contains(id)).unwrap_or(target);
+        if saved.contains(&point) { progress.reused += 1; } else { pending.push(chunk); }
+        files.get_mut(&chunk.path).ok_or_else(|| err(Code::Retrieval, "missing indexed file"))?
+            .points.insert(chunk.key.clone(), point);
+    }
+    progress.embedding();
     let mut embedded = 0usize;
     let mut i = 0;
-    while i < chunks.len() {
+    while i < pending.len() {
         let mut batch: Vec<&Chunk> = Vec::new();
         let mut bytes = 0usize;
-        while i < chunks.len() && batch.len() < EMBED_BATCH {
-            let input_len = chunks[i].input().len();
+        while i < pending.len() && batch.len() < EMBED_BATCH {
+            let input_len = pending[i].input().len();
             if !batch.is_empty() && bytes + input_len > EMBED_BATCH_BYTES {
                 break;
             }
             bytes += input_len;
-            batch.push(&chunks[i]);
+            batch.push(pending[i]);
             i += 1;
         }
         let inputs: Vec<String> = batch.iter().map(|c| c.input()).collect();
-        let vectors = embedder.embed_documents_async(&inputs).await?;
+        let vectors = embedder.documents(&inputs).await?;
         // Pace requests to stay under the Bedrock tokens-per-minute quota.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         if vectors.len() != batch.len() {
@@ -102,18 +167,23 @@ pub async fn index_repository(
 
     // 3. Manifest LAST: this is what flips the active snapshot for readers.
     progress.stage("publishing", "Publishing the completed repository index.".into());
-    let manifest = manifest_point(&namespace, schema, &snapshot, rev, chunks.len());
+    let mut manifest = manifest_point(&namespace, schema, &snapshot, rev, total);
+    manifest["payload"]["files_v1"] = serde_json::to_value(files).map_err(|_| err(Code::Retrieval, "invalid snapshot file map"))?;
     qdrant.upsert(schema, vec![manifest]).await?;
     progress.indexed = true;
-    progress.stage("publishing", format!("Index saved: {} chunks. Cleaning up older snapshots.", chunks.len()));
-
-    // 4. Remove stale snapshots (best effort; the index is already published).
-    if let Err(e) = qdrant.delete_old_snapshots(&namespace, schema, &snapshot).await {
-        tracing::warn!(error = %e, "old-snapshot cleanup failed (index is still published)");
-    }
-
     progress.stage("summarizing", "Index saved. Preparing the repository description.".into());
-    Ok(chunks.len())
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn persist_chunks(chunks: &[Chunk], rev: &SourceRevision, schema: &Schema,
+    embedder: &impl super::pull::DocumentVectors, qdrant: &Qdrant, progress: &mut IndexProgress) -> Result<()> {
+    qdrant.ensure(schema).await?;
+    let previous = qdrant.manifest(&Namespace::for_revision(rev), schema)?;
+    let mut files = SnapshotFiles::new();
+    for c in chunks { files.entry(c.path.clone()).or_default().input_bytes += c.input().len(); }
+    progress.chunks = chunks.len();
+    persist_changes(chunks, files, previous.as_ref(), rev, schema, embedder, qdrant, progress).await
 }
 
 /// Count files with exactly the same filters and chunking as a full index.
@@ -302,6 +372,22 @@ fn split_keep_newlines(content: &str) -> Vec<&str> {
     out
 }
 
+/// Blob identity comes from the pinned tree, including on force-pushes and
+/// non-linear merges. NUL delimiters preserve tabs and newlines in file names.
+async fn list_blobs(repo_dir: &Path, sha: &str, token: &str) -> Result<Vec<(String, String)>> {
+    let raw = crate::git::index_git(repo_dir, &["ls-tree", "-r", "-z", sha], token).await?;
+    let mut entries = Vec::new();
+    for record in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let tab = record.iter().position(|b| *b == b'\t').ok_or_else(|| err(Code::Source, "invalid tree entry"))?;
+        let meta = std::str::from_utf8(&record[..tab]).map_err(|_| err(Code::Source, "invalid tree metadata"))?;
+        let fields: Vec<_> = meta.split_ascii_whitespace().collect();
+        if fields.len() != 3 { return Err(err(Code::Source, "invalid tree entry")); }
+        if fields[1] != "blob" || !matches!(fields[0], "100644" | "100755") { continue; }
+        if let Ok(path) = std::str::from_utf8(&record[tab+1..]) { entries.push((path.to_owned(), fields[2].to_owned())); }
+    }
+    Ok(entries)
+}
+
 /// List the file paths in the pinned tree (recursive). The tree itself is
 /// always present in a `blob:none` partial clone, so this needs no network.
 async fn list_tree(repo_dir: &Path, sha: &str, token: &str) -> Result<Vec<String>> {
@@ -320,19 +406,16 @@ async fn list_tree(repo_dir: &Path, sha: &str, token: &str) -> Result<Vec<String
 /// the promisor remote. `index_git` permits that (network on), which is safe:
 /// indexing only ever reads immutable objects of the pinned commit.
 pub(crate) async fn read_blob(repo_dir: &Path, sha: &str, path: &str, token: &str) -> Result<Option<String>> {
-    let spec = format!("{sha}:{path}");
-    // Size guard first (uses the local tree metadata; may lazy-fetch nothing).
-    if let Ok(bytes) = crate::git::index_git(repo_dir, &["cat-file", "-s", &spec], token).await {
-        if let Ok(n) = String::from_utf8_lossy(&bytes).trim().parse::<u64>() {
-            if n > MAX_FILE_BYTES {
-                return Ok(None);
-            }
-        }
-    }
-    let raw = match crate::git::index_git(repo_dir, &["cat-file", "blob", &spec], token).await {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
-    };
+    // Best-effort lookup for a possibly deleted path at a review head.
+    Ok(read_pinned_blob(repo_dir, &format!("{sha}:{path}"), token).await.unwrap_or(None))
+}
+
+async fn read_pinned_blob(repo_dir: &Path, spec: &str, token: &str) -> Result<Option<String>> {
+    let bytes = crate::git::index_git(repo_dir, &["cat-file", "-s", spec], token).await?;
+    let size = String::from_utf8_lossy(&bytes).trim().parse::<u64>()
+        .map_err(|_| err(Code::Source, "invalid blob size"))?;
+    if size > MAX_FILE_BYTES { return Ok(None); }
+    let raw = crate::git::index_git(repo_dir, &["cat-file", "blob", spec], token).await?;
     if raw.contains(&0) {
         return Ok(None); // binary
     }
@@ -451,8 +534,7 @@ mod tests {
     }
 }
 
-fn check_input_budget(chunks: &[Chunk], limit: usize) -> Result<()> {
-    let bytes = chunks.iter().map(|c| c.input().len()).sum::<usize>();
+fn check_input_budget(bytes: usize, limit: usize) -> Result<()> {
     if limit > 0 && bytes > limit {
         return Err(err(Code::Retrieval, "repository exceeds indexing input allowance"));
     }
@@ -468,8 +550,8 @@ mod budget_tests {
             content:"fn main() {}".into(), file_sha256:String::new(), key:String::new() };
         chunk.key=chunk.computed_key();
         let exact=chunk.input().len();
-        assert!(check_input_budget(&[chunk.clone()],exact).is_ok());
-        assert!(check_input_budget(&[chunk.clone()],exact-1).is_err());
-        assert!(check_input_budget(&[chunk],0).is_ok());
+        assert!(check_input_budget(exact,exact).is_ok());
+        assert!(check_input_budget(exact,exact-1).is_err());
+        assert!(check_input_budget(exact,0).is_ok());
     }
 }

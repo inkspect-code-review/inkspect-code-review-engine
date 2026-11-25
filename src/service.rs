@@ -28,7 +28,7 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
         let rev = job.target_revision();
         let policy = crate::ignore::load(clone.path(), &job.head_sha, &token).await?;
         let chunks = retrieval::indexer::index_repository(clone.path(), &job.head_sha, &rev, &schema, &bedrock, &qdrant, &token, policy.as_ref(), &mut progress, host.index_max_input_bytes).await?;
-        return Ok(json!({"revision":job.head_sha,"chunks":chunks,"embedded":chunks,"indexed":true,
+        return Ok(json!({"revision":job.head_sha,"chunks":chunks,"embedded":progress.embedded,"reused":progress.reused,"indexed":true,
             "scan":progress.scan,
             "description_sources":description_sources(clone.path(), &job.head_sha, &token).await?}));
     }
@@ -49,7 +49,7 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
         if start > u32::MAX as u64 || end > u32::MAX as u64 || !location.valid() || end - start > 400 {
             return Err(err(Code::QueueInvalid, "invalid source range"));
         }
-        let content = qdrant.source(&ns, &schema, &manifest.snapshot, path, start as u32, end as u32)?
+        let content = qdrant.source(&ns, &schema, &manifest, path, start as u32, end as u32)?
             .ok_or_else(|| err(Code::Source, "saved source unavailable"))?;
         return Ok(json!({"revision": job.head_sha,"path":path,"start_line":start,"end_line":end,"content":content}));
     }
@@ -64,9 +64,9 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
     };
     let dependency_question = retrieval::chat::asks_for_lockfile(question);
     let candidates = if inspection {
-        qdrant.query_files(&ns, &schema, &manifest.snapshot, &vector, rc.candidates.clamp(1,50))?
+        qdrant.query_files(&ns, &schema, &manifest, &vector, rc.candidates.clamp(1,50))?
     } else {
-        qdrant.query(&ns, &schema, &manifest.snapshot, &vector, rc.candidates.clamp(1,50))?
+        qdrant.query(&ns, &schema, &manifest, &vector, rc.candidates.clamp(1,50))?
     };
     let candidate_count = candidates.len();
     let candidate_files = candidates.iter().map(|c| c.path.clone()).collect::<std::collections::HashSet<_>>().len();
