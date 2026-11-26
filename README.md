@@ -28,6 +28,16 @@ private configuration. To run the review, set `OPENAI_API_KEY` in your environme
 and repeat the last command with `--run`. The receipt includes the report path.
 For a Git working tree, the default comparison is the current files against `HEAD`.
 
+## Inside a local review
+
+[The local command](src/local.rs) builds a snapshot of the eligible files and sends the diff to the selected model. A clean working tree produces an empty review without a model call. [The review module](src/review.rs) checks proposed locations against the diff and assigns finding IDs. [The renderer](src/render.rs) turns the resulting report into Markdown and GitHub comments.
+
+When changing how findings are identified or validated, run the review module’s unit tests from the engine checkout:
+
+```sh
+cargo test --locked --bin inkspect-engine review::tests::
+```
+
 ## Other workflows
 
 - [Review a GitHub pull request](docs/USAGE.md#2-connect-github) and [publish findings](docs/USAGE.md#post-the-review-to-github).
