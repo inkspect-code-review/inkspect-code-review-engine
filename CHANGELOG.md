@@ -11,6 +11,12 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+### 2026-11-26
+
+#### Changed
+
+- Add a local review quick start and move advanced workflows into the usage guide.
+
 ### 2026-11-25
 
 #### Changed

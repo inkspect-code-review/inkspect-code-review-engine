@@ -92,7 +92,7 @@ per-run directories are mode 0700 and configs mode 0600. Windows users should us
 WSL for these Unix permission guarantees.
 
 To reuse a config for subsequent reviews, use `inkspect-engine with-provider` as
-documented in the README. It supports local, PR and inline snapshot reviews. The
+documented in the [provider guide](USAGE.md#option-b-openai-anthropic-or-google). It supports local, PR and inline snapshot reviews. The
 `prepare-job` command replaces hand-written PR metadata scripts and requires
 only the authenticated GitHub CLI in addition to the engine.
 
