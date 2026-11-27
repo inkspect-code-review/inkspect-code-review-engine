@@ -522,7 +522,7 @@ pub async fn run(host: &HostConfig, path: &Path, base: Option<&str>) -> Result<R
             snapshot.skipped
         ));
     }
-    crate::render::attach(&mut report);
+    crate::render::attach_with_direction(&mut report, host.diagram_direction);
     Ok(report)
 }
 

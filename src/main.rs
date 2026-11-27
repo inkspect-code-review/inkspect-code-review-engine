@@ -93,7 +93,7 @@ enum Command {
         #[arg(long)] config: PathBuf,
         #[arg(long)] job: PathBuf,
         #[arg(long)] request: PathBuf,
-        #[arg(long, value_parser = ["index", "index-stats", "context", "source", "describe", "fix", "verify-fix"])] mode: String,
+        #[arg(long, value_parser = ["index", "index-slice", "index-stats", "context", "source", "describe", "fix", "verify-fix"])] mode: String,
         #[arg(long)] out: PathBuf,
     },
     /// Run a single PR review end to end.
@@ -192,7 +192,7 @@ async fn run(cli: Cli) -> error::Result<()> {
             let job: ReviewJob = load_json(&job, "job")?;
             let request: serde_json::Value = load_json(&request, "request")?;
             let result = tokio::time::timeout(std::time::Duration::from_secs(host.timeout_seconds), service::operation(&host, &job, &mode, request)).await
-                .map_err(|_| error::err(error::Code::Internal, if mode == "index" { "index slice expired" } else { "operation timeout" }))??;
+                .map_err(|_| error::err(error::Code::Internal, if matches!(mode.as_str(), "index" | "index-slice") { "index slice expired" } else { "operation timeout" }))??;
             std::fs::write(out, serde_json::to_vec(&result).unwrap()).map_err(|_| error::err(error::Code::Internal, "output write failed"))?;
             Ok(())
         },

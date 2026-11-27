@@ -159,10 +159,26 @@ impl Qdrant {
         if kind != "manifest" || snapshot.is_empty() {
             return Err(err(Code::Retrieval, "invalid manifest payload"));
         }
+        let files = if let Some(count)=point.payload.get("file_pages") {
+            let pages=count.as_array().filter(|p|p.len()<=1_000_000).ok_or_else(||err(Code::Retrieval,"invalid manifest pages"))?;
+            let mut files=SnapshotFiles::new();
+            for page in pages {
+                let hash=page.as_str().ok_or_else(||err(Code::Retrieval,"invalid manifest page key"))?;
+                let id=Self::page_id(ns,schema,snapshot,hash);
+                let raw=block_on(self.post(&route,&serde_json::json!({"ids":[id],"with_payload":true,"with_vector":false})))?;
+                let payload=&raw[0]["payload"];
+                if raw[0]["id"]!=id || payload["snapshot"]!=snapshot { return Err(err(Code::Retrieval,"missing manifest page")); }
+                let batch:SnapshotFiles=serde_json::from_value(payload["files"].clone()).map_err(|_|err(Code::Retrieval,"invalid manifest page"))?;
+                files.extend(batch);
+            }
+            Some(files)
+        } else {
+            point.payload.get("files_v1").cloned().map(serde_json::from_value).transpose()
+                .map_err(|_| err(Code::Retrieval,"invalid snapshot file map"))?
+        };
         Ok(Some(Manifest {
             snapshot: snapshot.to_string(),
-            files: point.payload.get("files_v1").cloned().map(serde_json::from_value).transpose()
-                .map_err(|_| err(Code::Retrieval, "invalid snapshot file map"))?,
+            files,
             revision: point.payload.get("revision").cloned().map(serde_json::from_value).transpose()
                 .map_err(|_| err(Code::Retrieval, "invalid manifest revision"))?,
         }))
@@ -220,13 +236,26 @@ impl Qdrant {
             body["group_by"] = serde_json::json!("chunk.path");
             body["group_size"] = serde_json::json!(1);
         }
-        let result = block_on(self.post(&route, &body))?;
-        if result.is_null() {
-            return Ok(Vec::new());
+        let ids=body["filter"]["must"][6]["has_id"].as_array().filter(|ids|ids.len()>8192).cloned();
+        let mut points=Vec::new();
+        let batches=ids.as_ref().map_or(1,|all|all.len().div_ceil(8192));
+        for page in 0..batches {
+            if let Some(all)=&ids {
+                body["filter"]["must"][6]["has_id"]=serde_json::json!(all[page*8192..all.len().min((page+1)*8192)]);
+            }
+            let result=block_on(self.post(&route,&body))?;
+            if result.is_null(){continue;}
+            let batch=query_points(result,grouped,limit)?;
+            if batch.len()>limit{return Err(err(Code::Retrieval,"query returned too many points"));}
+            points.extend(batch);
         }
-        let points = query_points(result, grouped, limit)?;
-        if points.len() > limit {
-            return Err(err(Code::Retrieval, "query returned too many points"));
+        if batches>1 {
+            points.sort_by(|a,b|b.score.total_cmp(&a.score).then_with(||a.id.cmp(&b.id)));
+            if grouped {
+                let mut seen=std::collections::HashSet::new();
+                points.retain(|p|seen.insert(p.payload["chunk"]["path"].as_str().unwrap_or("").to_owned()));
+            }
+            points.truncate(limit);
         }
 
         let mut chunks = Vec::with_capacity(points.len());
@@ -405,6 +434,36 @@ impl Qdrant {
         if result.get("status").and_then(|v| v.as_str()) != Some("completed") {
             return Err(err(Code::Retrieval, "qdrant write incomplete"));
         }
+        Ok(())
+    }
+
+    fn page_id(ns:&Namespace,schema:&Schema,snapshot:&str,page:&str)->String {
+        super::hash::point_id(&GoJson::Array(vec![GoJson::s("manifest-page-v1"),ns.go_json(),schema.go_json(),
+            GoJson::s(snapshot),GoJson::s(page.to_string())]))
+    }
+
+    pub(super) async fn attach_files(&self,ns:&Namespace,schema:&Schema,snapshot:&str,manifest:&mut serde_json::Value,files:SnapshotFiles)->Result<()> {
+        if files.len()<512 && files.values().map(|f|f.points.len()).sum::<usize>()<8_192 {
+            manifest["payload"]["files_v1"]=serde_json::json!(files);
+            return Ok(());
+        }
+        let mut entries=files.into_iter().peekable();
+        let mut pages=Vec::new();
+        while entries.peek().is_some() {
+            let mut page=SnapshotFiles::new();
+            let mut points=0;
+            while page.len()<512 && points<8192 {
+                let Some((path,file))=entries.next() else {break};
+                points+=file.points.len();page.insert(path,file);
+            }
+            use sha2::{Digest,Sha256};
+            let hash=hex::encode(Sha256::digest(serde_json::to_vec(&page).map_err(|_|err(Code::Retrieval,"invalid manifest page"))?));
+            self.upsert(schema,vec![serde_json::json!({"id":Self::page_id(ns,schema,snapshot,&hash),
+                "vector":vec![0.0f32;schema.dimensions as usize],
+                "payload":{"kind":"manifest_page","snapshot":snapshot,"files":page}})]).await?;
+            pages.push(hash);
+        }
+        manifest["payload"]["file_pages"]=serde_json::json!(pages);
         Ok(())
     }
 

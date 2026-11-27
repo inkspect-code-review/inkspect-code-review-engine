@@ -234,6 +234,11 @@ impl<'a> Pipeline<'a> {
             }
         };
 
+        self.enrich_snapshot(rev, focus, changed, &manifest)
+    }
+
+    pub fn enrich_snapshot(&self, rev: &SourceRevision, focus: &str, changed: &[ChangedFile], manifest: &qdrant::Manifest) -> Result<Vec<Retrieved>> {
+        let namespace = Namespace::for_revision(rev);
         let prefix = bounded(focus, 1800);
         let queries = self.build_queries(&prefix, changed);
 
@@ -251,12 +256,12 @@ impl<'a> Pipeline<'a> {
             let mut points = self.qdrant.query_files(
                 &namespace,
                 &self.schema,
-                &manifest,
+                manifest,
                 &vector,
                 self.config.candidates,
             )?;
             points.extend(self.qdrant.query(
-                &namespace, &self.schema, &manifest, &vector, self.config.candidates,
+                &namespace, &self.schema, manifest, &vector, self.config.candidates,
             )?);
             let mut seen = std::collections::HashSet::new();
 

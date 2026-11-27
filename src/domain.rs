@@ -107,6 +107,8 @@ pub struct VerificationGap {
 /// diagram syntax.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagramNode {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub decision: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_ids: Vec<String>,
     pub id: String,
@@ -127,9 +129,20 @@ pub struct DiagramEdge {
     pub missing: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub enum DiagramDirection {
+    #[default]
+    #[serde(rename = "TD")]
+    TopDown,
+    #[serde(rename = "LR")]
+    LeftToRight,
+}
+
 /// Bounded structured diagram data. Renderers never accept raw Mermaid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagram {
+    #[serde(default)]
+    pub direction: DiagramDirection,
     pub title: String,
     /// "current" or "proposed".
     pub view: String,

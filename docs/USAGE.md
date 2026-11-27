@@ -347,10 +347,14 @@ has no index. **For this CLI, that flag enables initial indexing; it does not
 watch GitHub or schedule future reviews.** Embedding and reranking have their own
 provider costs, even when the review model uses a direct OpenAI or Anthropic key.
 
-Retrieved chunks are checked against the pinned repository revision before they
-are used. If retrieval is unavailable, the review continues without that context
-and prints a warning. Keep the embedding model and dimensions consistent with
-your index; changing them requires a compatible new index.
+Retrieved chunks are checked against the pinned repository revision before use.
+By default, the review can continue if retrieval fails. To require indexed
+context for batched PR reviews, set `token_planned_review`,
+`require_indexed_context` and `prepare_review_snapshot` to `true` in the host
+config. The engine indexes eligible files at the PR head, reuses vectors for
+unchanged code and starts model review after retrieval succeeds. Each review
+uses its own file list. The shared repository index stays available to other
+readers. Keep the embedding model and dimensions consistent with your index.
 
 ## Docker Compose
 

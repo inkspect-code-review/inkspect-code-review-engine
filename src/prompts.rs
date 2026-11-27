@@ -103,7 +103,7 @@ OUTPUT SCHEMA (all fields required unless marked optional; no additional fields)
     "meaningful": true,
     "title": "short title of the changed behavior",
     "view": "current",
-    "nodes": [ { "id": "a", "label": "step", "issue": false } ],
+    "nodes": [ { "id": "a", "label": "step", "decision": false, "issue": false } ],
     "edges": [ { "from": "a", "to": "b", "label": "transition", "missing": false } ]
   }
 }
@@ -115,7 +115,7 @@ PRIOR FINDINGS
 The optional untrusted_prior_findings array contains historical review data. For each item consider the original failure and all affected paths against the current changed source. Return a resolution only when you can positively verify the repair and cite the implementation line that demonstrates it. Missing findings, moved lines, promises, comments, tests alone, and partial fixes are insufficient. Omit uncertain or continuing items. Do not include source snippets, secrets, links or mentions in explanations. Return an empty array when no supplied item qualifies.
 
 DIAGRAM RULES
-The diagram describes the CHANGED control/data flow only. Use 2-30 nodes and 1-60 edges; labels and the title are at most 200 characters; node ids are at most 64 characters, unique, and referenced by edges. If the change has no meaningful flow, return "diagram": {"meaningful": false} and omit nodes/edges. Do NOT emit Mermaid, Markdown, URLs, or any field not listed above. Node labels are plain text; do not attempt any diagram or markup syntax.
+The diagram describes the CHANGED control/data flow only. Use short action labels. Mark a node "decision": true only for a real condition that chooses between outcomes. Phrase it as a short question and label each outgoing branch with its outcome. Keep parallel actions as steps. Mark a node "issue": true only when a reported finding affects that step. Use 2-30 nodes and 1-60 edges; labels and the title are at most 200 characters; node ids are at most 64 characters, unique, and referenced by edges. If the change has no meaningful flow, return "diagram": {"meaningful": false} and omit nodes/edges. Do NOT emit Mermaid, Markdown, URLs, or any field not listed above. Node labels are plain text; do not attempt any diagram or markup syntax.
 
 SCORES
 "scores" rates the CHANGED code only. Each dimension has an integer "score" from 1 (poor) to 5 (excellent), a "rationale" (why that score, grounded in the changed code), and "to_improve" (what would raise it to 5/5). The dimensions:

@@ -337,6 +337,58 @@ async fn merged_tree_reuses_only_current_chunks_and_preserves_previous_sources()
     assert!(index_repository(dir.path(),&broken,&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),0).await.is_err());
     assert_eq!(db.manifest(&ns,&schema).unwrap().unwrap().revision.unwrap().revision_id,text_b);
 
+    // A PR sees its own entire tree without switching the shared index or
+    // changing another review's membership, even after a failed preparation.
+    use crate::retrieval::indexer::review_snapshot;
+    let shared = db.manifest(&ns, &schema).unwrap().unwrap();
+    let mut first_pr = rev.clone();
+    first_pr.revision_id = first.clone();
+    let mut next_pr = rev.clone();
+    next_pr.revision_id = next.clone();
+    let (left, right) = tokio::join!(
+        async { review_snapshot(dir.path(), &first_pr, &schema, &embed, &db, "", None,
+            &mut IndexProgress::default(), 0, Some(&shared)).await.unwrap() },
+        async { review_snapshot(dir.path(), &next_pr, &schema, &embed, &db, "", Some(&ignore),
+            &mut IndexProgress::default(), 0, Some(&shared)).await.unwrap() },
+    );
+    assert_eq!(db.source(&ns,&schema,&left,"edited.rs",1,1).unwrap().as_deref(),Some("old"));
+    assert_eq!(db.source(&ns,&schema,&right,"edited.rs",1,1).unwrap().as_deref(),Some("new"));
+    assert!(db.source(&ns,&schema,&right,"nowignored.rs",1,1).unwrap().is_none());
+    assert!(review_snapshot(dir.path(), &rev, &schema, &embed, &db, "", None,
+        &mut IndexProgress::default(), 0, Some(&shared)).await.is_err());
+    assert_eq!(db.manifest(&ns,&schema).unwrap().unwrap().revision,shared.revision);
+
+    // A cold index larger than two MB spans budgeted slices. No intermediate
+    // manifest can replace the active index, and the next revision embeds only its delta.
+    use crate::retrieval::indexer::slice::run_at;
+    let content=format!("{}\n","a".repeat(100)).repeat(4200);
+    let large=tree(dir.path(), &[("one.rs",&content),("two.rs",&content),("three.rs",&content),("four.rs",&content),("five.rs",&content)]);
+    let changed=tree(dir.path(), &[("one.rs","small replacement"),("two.rs",&content),("three.rs",&content),("four.rs",&content)]);
+    rev.revision_id=large.clone();
+    let checkpoint=tempfile::tempdir().unwrap();
+    let mut slices=0;
+    loop {
+        let page=run_at(checkpoint.path(),dir.path(),&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),1_000_000_000,384_000).await.unwrap();
+        slices+=1;
+        if page["indexed"]==true {break;}
+        assert_eq!(page["indexed"],false);
+        assert_eq!(db.manifest(&ns,&schema).unwrap().unwrap().revision.unwrap().revision_id,text_b);
+        assert!(slices<25);
+    }
+    assert!(slices>1);
+    assert!(db.manifest(&ns,&schema).unwrap().unwrap().files.unwrap().values().map(|f|f.input_bytes).sum::<usize>()>2_000_000);
+    rev.revision_id=changed;
+    embed.0.borrow_mut().clear();
+    let next_checkpoint=tempfile::tempdir().unwrap();
+    let page=run_at(next_checkpoint.path(),dir.path(),&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),1_000_000_000,384_000).await.unwrap();
+    assert_eq!(page["indexed"],true);
+    assert_eq!(embed.0.borrow().len(),1);
+    let manifest=db.manifest(&ns,&schema).unwrap().unwrap();
+    assert!(!manifest.files.unwrap().contains_key("five.rs"));
+    let too_small=tempfile::tempdir().unwrap();
+    let page=run_at(too_small.path(),dir.path(),&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),1,384_000).await.unwrap();
+    assert_eq!(page["size_exceeded"],true);
+
     let empty = tree(dir.path(), &[]);
     rev.revision_id = empty.clone();
     index_repository(dir.path(),&empty,&rev,&schema,&embed,&db,"",None,&mut IndexProgress::default(),0).await.unwrap();

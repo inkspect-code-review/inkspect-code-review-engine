@@ -27,6 +27,8 @@ use crate::error::{err, Code, Result};
 use crate::ignore::IgnorePolicy;
 use crate::index_progress::{IndexProgress, Scan};
 
+pub mod slice;
+
 const CHUNK_LINES: usize = 80;
 const CHUNK_BYTES: usize = 2400;
 const OVERLAP_LINES: usize = 8;
@@ -54,7 +56,16 @@ pub async fn index_repository(
     let ns = Namespace::for_revision(rev);
     qdrant.ensure(schema).await?;
     let previous = qdrant.manifest(&ns, schema)?;
-    let previous_files = previous.as_ref().and_then(|m| m.files.as_ref());
+    let (changed, files) = collect_snapshot(repo_dir, head_sha, token, ignore, progress, max_input_bytes, previous.as_ref()).await?;
+    persist_changes(&changed, files, previous.as_ref(), rev, schema, embedder, qdrant, progress).await?;
+    Ok(progress.chunks)
+}
+
+async fn collect_snapshot(
+    repo_dir: &Path, head_sha: &str, token: &str, ignore: Option<&IgnorePolicy>,
+    progress: &mut IndexProgress, max_input_bytes: usize, previous: Option<&Manifest>,
+) -> Result<(Vec<Chunk>, SnapshotFiles)> {
+    let previous_files = previous.and_then(|m| m.files.as_ref());
     let tree = list_blobs(repo_dir, head_sha, token).await?;
     let mut files = SnapshotFiles::new();
     let mut changed = Vec::new();
@@ -92,8 +103,7 @@ pub async fn index_repository(
     progress.scan.stage = "completed".into();
     progress.reading(true);
     check_input_budget(files.values().map(|file| file.input_bytes).sum(), max_input_bytes)?;
-    persist_changes(&changed, files, previous.as_ref(), rev, schema, embedder, qdrant, progress).await?;
-    Ok(progress.chunks)
+    Ok((changed, files))
 }
 
 async fn persist_changes(chunks: &[Chunk], mut files: SnapshotFiles, previous: Option<&Manifest>,
@@ -105,6 +115,33 @@ async fn persist_changes(chunks: &[Chunk], mut files: SnapshotFiles, previous: O
     progress.stage("embedding", format!("Indexing changed chunks for {total} repository chunks."));
     if let Some(m) = previous { qdrant.archive_previous(&namespace, schema, m, &snapshot).await?; }
 
+    let mut remaining = usize::MAX;
+    persist_points(chunks, &mut files, previous, rev, schema, embedder, qdrant, progress, &mut remaining).await?;
+    publish_files(files, rev, schema, qdrant, progress).await
+}
+
+/// Keep this review's file membership in memory. Only immutable chunk points
+/// are shared with concurrent reviews and the default-branch indexer.
+pub async fn review_snapshot(
+    repo_dir: &Path, rev: &SourceRevision, schema: &Schema,
+    embedder: &impl super::pull::DocumentVectors, qdrant: &Qdrant, token: &str,
+    ignore: Option<&IgnorePolicy>, progress: &mut IndexProgress, max_input_bytes: usize,
+    previous: Option<&Manifest>,
+) -> Result<Manifest> {
+    qdrant.ensure(schema).await?;
+    let (changed, mut files) = collect_snapshot(repo_dir, &rev.revision_id, token, ignore,
+        progress, max_input_bytes, previous).await?;
+    let mut remaining = usize::MAX;
+    persist_points(&changed, &mut files, previous, rev, schema, embedder, qdrant, progress, &mut remaining).await?;
+    Ok(Manifest { snapshot: snapshot_id(rev, schema), revision: Some(rev.clone()), files: Some(files) })
+}
+
+async fn persist_points(chunks: &[Chunk], files: &mut SnapshotFiles, previous: Option<&Manifest>,
+    rev: &SourceRevision, schema: &Schema, embedder: &impl super::pull::DocumentVectors,
+    qdrant: &Qdrant, progress: &mut IndexProgress, remaining: &mut usize) -> Result<bool> {
+    let namespace = Namespace::for_revision(rev);
+    let snapshot = snapshot_id(rev, schema);
+    let total = progress.chunks;
     // A legacy manifest has one physical snapshot. Newer manifests may reference
     // immutable points from multiple commits. The target revision can also have
     // already persisted points from an interrupted run.
@@ -142,6 +179,8 @@ async fn persist_changes(chunks: &[Chunk], mut files: SnapshotFiles, previous: O
             batch.push(pending[i]);
             i += 1;
         }
+        if bytes > *remaining { return Ok(false); }
+        *remaining -= bytes;
         let inputs: Vec<String> = batch.iter().map(|c| c.input()).collect();
         let vectors = embedder.documents(&inputs).await?;
         // Pace requests to stay under the Bedrock tokens-per-minute quota.
@@ -165,10 +204,18 @@ async fn persist_changes(chunks: &[Chunk], mut files: SnapshotFiles, previous: O
         tracing::info!(embedded, total, "indexing progress");
     }
 
+    Ok(true)
+}
+
+async fn publish_files(files: SnapshotFiles, rev: &SourceRevision, schema: &Schema, qdrant: &Qdrant,
+    progress: &mut IndexProgress) -> Result<()> {
+    let namespace = Namespace::for_revision(rev);
+    let snapshot = snapshot_id(rev, schema);
+    let total = progress.chunks;
     // 3. Manifest LAST: this is what flips the active snapshot for readers.
     progress.stage("publishing", "Publishing the completed repository index.".into());
     let mut manifest = manifest_point(&namespace, schema, &snapshot, rev, total);
-    manifest["payload"]["files_v1"] = serde_json::to_value(files).map_err(|_| err(Code::Retrieval, "invalid snapshot file map"))?;
+    qdrant.attach_files(&namespace,schema,&snapshot,&mut manifest,files).await?;
     qdrant.upsert(schema, vec![manifest]).await?;
     progress.indexed = true;
     progress.stage("summarizing", "Index saved. Preparing the repository description.".into());

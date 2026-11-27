@@ -11,6 +11,14 @@ included. The package's `0.1.0` version does not imply a published tagged releas
 
 ## Unreleased
 
+- 2026-11-27 — Emit an activity receipt when a review starts preparing its repository index, including the indexed revision when known.
+
+- 2026-11-27 — Render PR diagrams vertically by default, with diamonds for decisions and distinct colors for decisions and issues. Hosts can select a horizontal layout.
+
+- 2026-11-27 — Batched PR reviews with required indexed context now prepare the index for the reviewed commit before inference. Concurrent reviews keep their own file lists and can reuse unchanged vectors from the shared repository index.
+
+- 2026-11-27 — Support resumable bounded index batches and incremental repository snapshots.
+
 ### 2026-11-26
 
 #### Changed

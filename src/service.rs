@@ -8,7 +8,7 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
     if mode == "fix" { return crate::fix::run(host, job, request).await; }
     // Context and source reads use the durable index. Only operations that
     // acquire new repository content need GitHub credentials or a clone.
-    if mode == "index" || mode == "index-stats" || mode == "describe" {
+    if mode == "index" || mode == "index-slice" || mode == "index-stats" || mode == "describe" {
         let mut progress = crate::index_progress::IndexProgress::new();
         if mode == "index" { progress.stage("cloning", "Downloading repository at the selected revision.".into()); }
         let token = std::env::var("INKSPECT_GITHUB_READ_TOKEN").map_err(|_| err(Code::GitHub, "missing scoped token"))?;
@@ -26,6 +26,14 @@ pub async fn operation(host: &HostConfig, job: &ReviewJob, mode: &str, request: 
         let qdrant = retrieval::qdrant::Qdrant::from_env()?;
         let schema = retrieval::Schema::cohere(rc.dimensions);
         let rev = job.target_revision();
+        if mode == "index-slice" {
+            let bytes=request["slice_bytes"].as_u64().ok_or_else(||err(Code::QueueInvalid,"missing slice budget"))?;
+            let bytes = usize::try_from(bytes).ok().filter(|n| (64_000..=4_000_000).contains(n))
+                .ok_or_else(|| err(Code::QueueInvalid,"invalid index slice allowance"))?;
+            let policy = crate::ignore::load(clone.path(), &job.base_sha, &token).await?;
+            return retrieval::indexer::slice::run(clone.path(), &rev, &schema, &bedrock, &qdrant, &token,
+                policy.as_ref(), &mut progress, host.index_max_input_bytes, bytes).await;
+        }
         let policy = crate::ignore::load(clone.path(), &job.head_sha, &token).await?;
         let chunks = retrieval::indexer::index_repository(clone.path(), &job.head_sha, &rev, &schema, &bedrock, &qdrant, &token, policy.as_ref(), &mut progress, host.index_max_input_bytes).await?;
         return Ok(json!({"revision":job.head_sha,"chunks":chunks,"embedded":progress.embedded,"reused":progress.reused,"indexed":true,

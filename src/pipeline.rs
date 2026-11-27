@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use crate::config::{HostConfig, ReviewJob};
-use crate::domain::{IgnoreSnapshot, Report, ReviewExclusions};
+use crate::domain::{IgnoreSnapshot, Report, ReviewExclusions, SourceRevision};
 use crate::error::{Code, Result};
 use crate::git::{self, DiffSummary};
 use crate::github::GitHub;
@@ -159,7 +159,7 @@ pub async fn run(
                 all_excluded,
             );
             report.run.review_notes = job.review_notes.clone();
-            crate::render::attach(&mut report);
+            crate::render::attach_with_direction(&mut report, host.diagram_direction);
             crate::telemetry::record(serde_json::json!({"kind":"report.ready"}))?;
             publish(&gh, job, &report).await;
             return Ok(report);
@@ -171,7 +171,10 @@ pub async fn run(
             Ok(context) => context,
             Err(e) => {
                 crate::telemetry::record(serde_json::json!({"kind":"review.retrieval_failed"}))?;
-                if host.require_indexed_context { return Err(e); }
+                if host.require_indexed_context {
+                    crate::telemetry::record(serde_json::json!({"kind":"model.skipped","reason":"required_context_unavailable"}))?;
+                    return Err(e);
+                }
                 (Vec::new(), None)
             }
         };
@@ -190,7 +193,7 @@ pub async fn run(
         }
         let mut report = review::with_exclusions(report, exclusions);
         report.run.review_notes = job.review_notes.clone();
-        crate::render::attach(&mut report);
+        crate::render::attach_with_direction(&mut report, host.diagram_direction);
         crate::telemetry::record(serde_json::json!({"kind":"report.ready"}))?;
         publish(&gh, job, &report).await;
         return Ok(report);
@@ -290,7 +293,7 @@ pub async fn run(
     }
     report.resolved_findings = resolutions;
     report.run.review_notes = job.review_notes.clone();
-    crate::render::attach(&mut report);
+    crate::render::attach_with_direction(&mut report, host.diagram_direction);
     crate::telemetry::record(serde_json::json!({"kind":"report.ready"}))?;
     // Prompt provenance and the complete input are retained in the private
     // model-context capture, separate from the public report.
@@ -331,6 +334,13 @@ async fn publish(gh: &GitHub, job: &ReviewJob, report: &Report) {
     }
 }
 
+fn index_start_receipt(target: &SourceRevision, indexed: Option<&SourceRevision>) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "review.index.started", "target_revision": target.revision_id,
+        "indexed_revision": indexed.filter(|r| r.same_repository(target)).map(|r| &r.revision_id),
+    })
+}
+
 /// Build the retrieval pipeline and run it. Separated so its errors can be
 /// caught and downgraded to a warning by the caller.
 async fn retrieve(
@@ -359,21 +369,39 @@ async fn retrieve(
     let schema = Schema::cohere(rc.dimensions);
     let namespace = crate::retrieval::Namespace::for_revision(target);
 
-    // If no index exists and automatic review is enabled, index the repository
-    // before retrieving so the first review on a repo still gets RAG context.
     let manifest = qdrant.manifest(&namespace, &schema)?;
-    if host.token_planned_review && !host.require_indexed_context {
-        if let Some(m) = &manifest {
+    let record_index_start = || crate::telemetry::record(index_start_receipt(
+        target, manifest.as_ref().and_then(|m| m.revision.as_ref()),
+    ));
+    if host.token_planned_review && (!host.require_indexed_context || host.prepare_review_snapshot) {
+        let review_manifest = if host.require_indexed_context {
+            let mut progress = crate::index_progress::IndexProgress::new();
+            record_index_start()?;
+            let prepared = crate::retrieval::indexer::review_snapshot(
+                repo_dir, target, &schema, &bedrock, &qdrant, token, policy,
+                &mut progress, host.index_max_input_bytes, manifest.as_ref(),
+            ).await?;
             crate::telemetry::record(serde_json::json!({"kind":"review.index",
-                "revision":m.revision.as_ref().map(|r| &r.revision_id),
-                "stale":m.revision.as_ref() != Some(target), "reused":true}))?;
-        }
+                "revision":job.head_sha,"reused":progress.embedded == 0,"chunks":progress.chunks}))?;
+            Some(prepared)
+        } else {
+            if let Some(m) = &manifest {
+                crate::telemetry::record(serde_json::json!({"kind":"review.index",
+                    "revision":m.revision.as_ref().map(|r| &r.revision_id),
+                    "stale":m.revision.as_ref() != Some(target), "reused":true}))?;
+            }
+            None
+        };
         let verifier = CloneVerifier { repo_dir, head_sha: &job.head_sha, token };
         let pipeline = Retrieval { config: rc, schema: schema.clone(), embedder: &bedrock,
             reranker: &bedrock, qdrant: &qdrant, verifier: &verifier, ignore: policy };
         if let Some(context) = crate::retrieval::pull::retrieve(&pipeline,&bedrock,job,&diff.files,
-            manifest.as_ref(),&review_focus(job),host.index_max_input_bytes).await? {
+            review_manifest.as_ref().or(manifest.as_ref()),&review_focus(job),host.index_max_input_bytes).await? {
             return Ok((Vec::new(), Some(context)));
+        }
+        if let Some(prepared) = review_manifest {
+            let snippets = pipeline.enrich_snapshot(target, &review_focus(job), &diff.files, &prepared)?;
+            return Ok((snippets, None));
         }
     }
     let needs_index = manifest.as_ref().is_none_or(|m| host.require_indexed_context && m.revision.as_ref() != Some(target));
@@ -381,6 +409,7 @@ async fn retrieve(
         if job.auto_review && (!host.token_planned_review || host.require_indexed_context) {
             tracing::info!("no index and auto-review enabled; indexing repository before review");
             let mut progress = crate::index_progress::IndexProgress::new();
+            record_index_start()?;
             let indexed = crate::retrieval::indexer::index_repository(
                 repo_dir,
                 &job.head_sha,
@@ -441,6 +470,19 @@ fn review_focus(job: &ReviewJob) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexing_receipt_only_identifies_a_manifest_from_the_target_repository() {
+        let target = SourceRevision { tenant_id: "workspace".into(), repository_id: "17".into(),
+            revision_id: "b".repeat(40), ..Default::default() };
+        let prior = SourceRevision { revision_id: "a".repeat(40), ..target.clone() };
+        let receipt = index_start_receipt(&target, Some(&prior));
+        assert_eq!(receipt["target_revision"], target.revision_id);
+        assert_eq!(receipt["indexed_revision"], prior.revision_id);
+        let foreign = SourceRevision { repository_id: "18".into(), ..prior };
+        assert!(index_start_receipt(&target, Some(&foreign))["indexed_revision"].is_null());
+        assert!(index_start_receipt(&target, None)["indexed_revision"].is_null());
+    }
 
     #[test]
     fn oversized_review_keeps_later_files_that_fit_the_serialized_prompt() {

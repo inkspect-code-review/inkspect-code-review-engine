@@ -67,6 +67,8 @@ pub struct RawDiagram {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawNode {
+    #[serde(default)]
+    pub decision: bool,
     pub id: String,
     pub label: String,
     #[serde(default)]

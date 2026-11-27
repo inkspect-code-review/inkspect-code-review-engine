@@ -18,6 +18,8 @@ use crate::error::{err, Code, Result};
 /// and/or environment; a job can never override any of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
+    #[serde(default)]
+    pub diagram_direction: crate::domain::DiagramDirection,
     /// AWS region for the review model (Bedrock Converse).
     pub model_region: String,
     /// Inference-profile model id for the single review call, e.g.
@@ -47,6 +49,10 @@ pub struct HostConfig {
     /// Require a current index and successful retrieval; never silently fall back.
     #[serde(default)]
     pub require_indexed_context: bool,
+    /// For strict batched reviews, build an index of the pinned PR tree without
+    /// publishing it as the active repository index.
+    #[serde(default)]
+    pub prepare_review_snapshot: bool,
     /// Operator ceiling on embedding input bytes, checked before any index call.
     /// Zero preserves the normal repository limits.
     #[serde(default)]

@@ -300,6 +300,7 @@ fn validate_diagram(d: RawDiagram, notes: &mut Vec<String>) -> Option<Diagram> {
             id: n.id,
             label: n.label,
             issue: n.issue,
+            decision: n.decision,
         });
     }
     let mut edges = Vec::with_capacity(d.edges.len());
@@ -317,6 +318,7 @@ fn validate_diagram(d: RawDiagram, notes: &mut Vec<String>) -> Option<Diagram> {
         });
     }
     Some(Diagram {
+        direction: Default::default(),
         title,
         view,
         nodes,
@@ -390,11 +392,17 @@ pub fn sanitize_text(s: &str, max: usize) -> String {
 /// sanitizing labels so model/source text cannot inject Mermaid syntax. Mirrors
 /// the Go engine's `report.Mermaid` + `mermaidLabel`.
 pub fn mermaid(d: &Diagram) -> String {
-    let mut b = String::from("flowchart LR\n");
+    use crate::domain::DiagramDirection;
+    let mut b = String::from(match d.direction {
+        DiagramDirection::TopDown => "flowchart TD\n",
+        DiagramDirection::LeftToRight => "flowchart LR\n",
+    });
     let mut index = std::collections::HashMap::new();
     for (i, n) in d.nodes.iter().enumerate() {
         index.insert(n.id.clone(), i);
-        b.push_str(&format!("    n{i}[\"{}\"]\n", mermaid_label(&n.label)));
+        let (open, close) = if n.decision { ('{', '}') } else { ('[', ']') };
+        let style = if n.issue { ":::issue" } else if n.decision { ":::decision" } else { "" };
+        b.push_str(&format!("    n{i}{open}\"{}\"{close}{style}\n", mermaid_label(&n.label)));
     }
     for e in &d.edges {
         let (Some(&from), Some(&to)) = (index.get(&e.from), index.get(&e.to)) else {
@@ -409,6 +417,12 @@ pub fn mermaid(d: &Diagram) -> String {
                 mermaid_label(&e.label)
             ));
         }
+    }
+    if d.nodes.iter().any(|n| n.decision && !n.issue) {
+        b.push_str("    classDef decision fill:#fff1c2,stroke:#956300,color:#382600\n");
+    }
+    if d.nodes.iter().any(|n| n.issue) {
+        b.push_str("    classDef issue fill:#ffe2df,stroke:#af3935,color:#481414\n");
     }
     b
 }

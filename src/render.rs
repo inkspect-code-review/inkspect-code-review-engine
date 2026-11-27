@@ -15,6 +15,13 @@ pub const ENGINE_VERSION: &str = match option_env!("INKSPECT_ENGINE_VERSION") {
     _ => env!("CARGO_PKG_VERSION"),
 };
 
+pub fn attach_with_direction(report: &mut Report, direction: crate::domain::DiagramDirection) {
+    if let Some(diagram) = &mut report.diagram {
+        diagram.direction = direction;
+    }
+    attach(report);
+}
+
 /// One source for CLI output, persisted reports, and both GitHub publishers.
 pub fn attach(report: &mut Report) {
     let full = markdown(report);
@@ -395,8 +402,8 @@ mod tests {
         let mut report = sample_report();
         report.summary = "<script>@everyone **fake**".into();
         report.run.review_notes.push(crate::config::ReviewNote { author: "@someone".into(), body: "Focus on validation".into() });
-        report.diagram = Some(Diagram { title: "Flow".into(), view: "current".into(), evidence_ids: vec![],
-            nodes: vec![DiagramNode { id: "injected-id".into(), label: "a\"] --> evil[\"b".into(), issue: false, evidence_ids: vec![] }], edges: vec![] });
+        report.diagram = Some(Diagram { direction: Default::default(), title: "Flow".into(), view: "current".into(), evidence_ids: vec![],
+            nodes: vec![DiagramNode { id: "injected-id".into(), decision: true, label: "a\"] --> evil[\"b".into(), issue: false, evidence_ids: vec![] }], edges: vec![] });
         report.findings.push(Finding { replacement_lines: None, id: "F-1".into(), title: "<b>@user</b>".into(), severity: Severity::Medium,
             reason: "A bug".into(), suggestion: "Fix it".into(), verification: "Check it".into(), advisory: None,
             revision: SourceRevision::default(), location: Location { path: "math.ts".into(), start_line: 3, end_line: 3 }, evidence_ids: vec![] });
@@ -405,6 +412,8 @@ mod tests {
         assert_eq!(p.markdown, markdown(&report));
         assert_eq!(p.github_summary, p.markdown);
         assert!(p.markdown.contains("### Scores") && p.markdown.contains("```mermaid"));
+        assert!(p.github_summary.contains("flowchart TD\n"));
+        assert!(p.github_summary.contains("n0{\"") && p.github_summary.contains("}:::decision"));
         assert!(p.markdown.contains("Focus on validation"));
         assert!(!p.markdown.contains("<script>") && !p.markdown.contains("@everyone"));
         assert!(!p.markdown.contains("injected-id") && !p.markdown.contains("--> evil"));
@@ -413,6 +422,25 @@ mod tests {
         assert!(p.github_findings["F-1"].contains(" review again`"));
         assert!(!p.github_findings["F-1"].contains("Reply “fixed”"));
         assert_eq!(p.fix_prompt, p.finding_prompts["F-1"]);
+    }
+
+    #[test]
+    fn saved_direction_and_node_roles_reach_github() {
+        let mut report = sample_report();
+        let legacy = serde_json::json!({"title":"Gate","view":"current","nodes":[
+            {"id":"check","label":"Ready?","decision":true},
+            {"id":"wait","label":"Wait","issue":true},
+            {"id":"run","label":"Run"}],
+            "edges":[{"from":"check","to":"wait","label":"No"},{"from":"check","to":"run","label":"Yes"}]});
+        report.diagram = Some(serde_json::from_value(legacy).unwrap());
+        attach_with_direction(&mut report, DiagramDirection::LeftToRight);
+        let recovered: Report = serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        let body = markdown(&recovered);
+        assert_eq!(body, report.presentation.unwrap().github_summary);
+        for fragment in ["flowchart LR", "n0{\"Ready?\"}:::decision", "n1[\"Wait\"]:::issue",
+                         "n2[\"Run\"]", "classDef decision", "classDef issue", "n0 -->|\"Yes\"| n2"] {
+            assert!(body.contains(fragment), "{fragment}");
+        }
     }
 
     #[test]

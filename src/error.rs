@@ -82,6 +82,7 @@ impl EngineError {
     // from provider prose, source text, paths or a model's explanation.
     pub fn diagnostic_code(&self) -> &'static str {
         match self.reason.as_str() {
+            "clone exceeded size limit" => "index.size_exceeded",
             "index slice expired" => "index.slice_expired",
             "generator could not propose a complete safe repair" => "fix.no_safe_repair",
             "invalid repair response" => "fix.invalid_response",
